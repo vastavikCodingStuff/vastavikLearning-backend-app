@@ -27,4 +27,7 @@ wheels/
 htmlcov/
 serviceAccountKey.json
 firebase-credentials.json
+firebase.json
+*firebase*.json
+*serviceAccount*.json
 uploads/

@@ -1,29 +1,38 @@
+import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
-import logging
 
 from app.core.config import settings
 
 logger = logging.getLogger("vastavik.db")
 
-# Attempt initializing Firebase Admin SDK if credentials file exists
+# Attempt initializing Firebase Admin SDK if credentials exist (file or JSON env)
 _firestore_client = None
 _firebase_initialized = False
 
-if settings.FIREBASE_CREDENTIALS_PATH and os.path.exists(settings.FIREBASE_CREDENTIALS_PATH):
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
 
+    cred = None
+    if settings.FIREBASE_CREDENTIALS_JSON:
+        cred_dict = json.loads(settings.FIREBASE_CREDENTIALS_JSON)
+        cred = credentials.Certificate(cred_dict)
+    elif settings.FIREBASE_CREDENTIALS_PATH and os.path.exists(settings.FIREBASE_CREDENTIALS_PATH):
         cred = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
-        firebase_admin.initialize_app(cred, {"projectId": settings.FIREBASE_PROJECT_ID})
+
+    if cred:
+        # Use existing default app if already initialized
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred, {"projectId": settings.FIREBASE_PROJECT_ID})
         _firestore_client = firestore.client()
         _firebase_initialized = True
-        logger.info("Firebase Firestore connected successfully.")
-    except Exception as e:
-        logger.warning(f"Could not initialize Firebase Firestore: {e}. Falling back to in-memory store.")
+        logger.info(f"Firebase Firestore connected successfully to project '{settings.FIREBASE_PROJECT_ID}'.")
+except Exception as e:
+    logger.warning(f"Could not initialize Firebase Firestore: {e}. Falling back to in-memory store.")
 
 
 class DatabaseRepository:
@@ -181,7 +190,11 @@ class DatabaseRepository:
     async def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
         if self.use_live_firestore:
             users_ref = _firestore_client.collection("users")
-            query = users_ref.where("email", "==", email.lower()).limit(1).stream()
+            try:
+                from google.cloud.firestore_v1.base_query import FieldFilter
+                query = users_ref.where(filter=FieldFilter("email", "==", email.lower())).limit(1).stream()
+            except Exception:
+                query = users_ref.where("email", "==", email.lower()).limit(1).stream()
             for doc in query:
                 data = doc.to_dict()
                 data["uid"] = doc.id
@@ -216,7 +229,7 @@ class DatabaseRepository:
 
     async def update_user(self, uid: str, updates: Dict[str, Any]) -> bool:
         if self.use_live_firestore:
-            _firestore_client.collection("users").document(uid).update(updates)
+            _firestore_client.collection("users").document(uid).set(updates, merge=True)
             return True
         else:
             if uid in self._memory_users:
@@ -227,6 +240,29 @@ class DatabaseRepository:
     # --- Catalog & Curriculum ---
 
     async def get_home_catalog(self) -> Dict[str, Any]:
+        if self.use_live_firestore:
+            live_courses = []
+            try:
+                for doc in _firestore_client.collection("courses").stream():
+                    d = doc.to_dict()
+                    live_courses.append({
+                        "id": doc.id,
+                        "title": d.get("title", "Untitled Course"),
+                        "description": d.get("description", ""),
+                        "icon_name": d.get("iconName") or d.get("icon_name", "code"),
+                        "color": int(d.get("color", 0xFF4A90E2)),
+                        "order": int(d.get("order", 1)),
+                        "is_published": d.get("is_published", True),
+                    })
+            except Exception as e:
+                logger.warning(f"Error querying live courses from Firestore: {e}")
+
+            return {
+                "courses": live_courses if live_courses else self._courses,
+                "banners": self._banners,
+                "popular_topics": self._popular_topics,
+            }
+
         return {
             "courses": self._courses,
             "banners": self._banners,
@@ -234,6 +270,35 @@ class DatabaseRepository:
         }
 
     async def get_course_curriculum(self, course_id: str) -> List[Dict[str, Any]]:
+        if self.use_live_firestore:
+            try:
+                course_ref = _firestore_client.collection("courses").document(course_id)
+                parts_stream = course_ref.collection("parts").stream()
+                parts = []
+                for p_doc in parts_stream:
+                    p_data = p_doc.to_dict()
+                    part_id = p_doc.id
+                    subparts_stream = course_ref.collection("parts").document(part_id).collection("subparts").stream()
+                    subparts = []
+                    for s_doc in subparts_stream:
+                        s_data = s_doc.to_dict()
+                        subparts.append({
+                            "subpart_id": s_doc.id,
+                            "title": s_data.get("title", ""),
+                            "lesson_id": s_data.get("lesson_id") or s_doc.id,
+                        })
+                    parts.append({
+                        "part_id": part_id,
+                        "title": p_data.get("title", ""),
+                        "order": int(p_data.get("order", 1)),
+                        "subparts": subparts,
+                    })
+                if parts:
+                    parts.sort(key=lambda x: x["order"])
+                    return parts
+            except Exception as e:
+                logger.warning(f"Error querying live curriculum for course {course_id}: {e}")
+
         return self._curriculums.get(course_id, [])
 
     async def get_lesson(self, lesson_id: str) -> Optional[Dict[str, Any]]:
@@ -265,7 +330,11 @@ class DatabaseRepository:
 
     async def get_notes(self, uid: str) -> List[Dict[str, Any]]:
         if self.use_live_firestore:
-            docs = _firestore_client.collection("notes").where("uid", "==", uid).stream()
+            try:
+                from google.cloud.firestore_v1.base_query import FieldFilter
+                docs = _firestore_client.collection("notes").where(filter=FieldFilter("uid", "==", uid)).stream()
+            except Exception:
+                docs = _firestore_client.collection("notes").where("uid", "==", uid).stream()
             return [{"id": d.id, **d.to_dict()} for d in docs]
         return self._memory_notes.get(uid, [])
 

@@ -49,8 +49,9 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
 
     # Firebase
-    FIREBASE_CREDENTIALS_PATH: Optional[str] = None
-    FIREBASE_PROJECT_ID: str = "vastavik-learning"
+    FIREBASE_CREDENTIALS_PATH: Optional[str] = "serviceAccountKey.json"
+    FIREBASE_CREDENTIALS_JSON: Optional[str] = None
+    FIREBASE_PROJECT_ID: str = "vastavikcomputers"
 
     # OAuth
     GITHUB_CLIENT_ID: Optional[str] = None
