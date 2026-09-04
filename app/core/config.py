@@ -1,0 +1,77 @@
+import os
+from typing import Optional
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+
+    # Server Environment
+    ENVIRONMENT: str = "development"
+    PORT: int = 8000
+    HOST: str = "0.0.0.0"
+    DEBUG: bool = True
+    ALLOWED_ORIGINS: str = "*"  # Comma-separated or "*"
+
+    def get_allowed_origins(self) -> list[str]:
+        if self.ALLOWED_ORIGINS.strip() == "*":
+            return ["*"]
+        return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",") if origin.strip()]
+
+    # Static API Keys (matching Android client AuthInterceptor.kt)
+    API_KEY_ID: str = "vastavik_prod_v1"
+    API_KEY_SECRET: str = "super_secret_hmac_production_key_change_me_32char"
+
+    # Enforce HMAC Check? (Can be toggled in dev/tests if needed)
+    ENFORCE_HMAC: bool = True
+
+    # JWT Authentication
+    JWT_SECRET_KEY: str = "super_jwt_secret_key_change_this_in_production_min_32_bytes"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # Default Admin
+    ADMIN_EMAIL: str = "admin@vastaviklearning.com"
+    ADMIN_PASSWORD: str = "admin@admin123"
+
+    # Judge0 External Code Runner
+    JUDGE0_URL: str = "http://139.84.172.230:2358"
+    JUDGE0_TIMEOUT_SECONDS: float = 10.0
+    JUDGE0_AUTH_TOKEN: Optional[str] = None
+
+    # AI API Keys
+    MISTRAL_API_KEY: Optional[str] = None
+    GEMINI_API_KEY: Optional[str] = None
+
+    # Firebase
+    FIREBASE_CREDENTIALS_PATH: Optional[str] = None
+    FIREBASE_PROJECT_ID: str = "vastavik-learning"
+
+    # OAuth
+    GITHUB_CLIENT_ID: Optional[str] = None
+    GITHUB_CLIENT_SECRET: Optional[str] = None
+    GOOGLE_CLIENT_ID: Optional[str] = None
+
+    # Payment Gateway
+    PAYMENT_GATEWAY_KEY: Optional[str] = None
+    PAYMENT_GATEWAY_SECRET: Optional[str] = None
+    PAYMENT_WEBHOOK_SECRET: Optional[str] = None
+
+    # Rate Limiting (Requests / minute)
+    RATE_LIMIT_AUTH: int = 5
+    RATE_LIMIT_AI: int = 10
+    RATE_LIMIT_CODE: int = 8
+    RATE_LIMIT_GENERAL: int = 120
+    RATE_LIMIT_WEBRTC: int = 600
+
+    # Uploads
+    UPLOAD_DIR: str = "./uploads"
+    MAX_UPLOAD_SIZE_MB: int = 50
+
+
+settings = Settings()
