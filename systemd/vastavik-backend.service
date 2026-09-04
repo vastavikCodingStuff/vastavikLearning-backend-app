@@ -1,0 +1,31 @@
+[Unit]
+Description=Vastavik Learning Platform FastAPI Backend Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/vastavik
+Environment="PATH=/var/www/vastavik/venv/bin:/usr/local/bin:/usr/bin"
+EnvironmentFile=/var/www/vastavik/.env
+ExecStart=/var/www/vastavik/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2 --proxy-headers --forwarded-allow-ips="*"
+
+# Resource Bounds (Strict limits for 2GB/4GB VPS)
+MemoryHigh=384M
+MemoryMax=512M
+CPUQuota=180%
+
+# Fault Resilience
+Restart=always
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# Security Hardening
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
