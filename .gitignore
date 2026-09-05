@@ -31,3 +31,4 @@ firebase.json
 *firebase*.json
 *serviceAccount*.json
 uploads/
+graphify-out/
