@@ -196,6 +196,110 @@ class SignalPacket(BaseModel):
 
 
 # ==========================================
+# 5b. Conversations & Socket.IO Schemas (anytype messages)
+# ==========================================
+
+class ConversationType(str):
+    DIRECT = "direct"
+    GROUP = "group"
+    CHANNEL = "channel"
+    SUPPORT = "support"
+
+
+class MessageType(str):
+    TEXT = "text"
+    IMAGE = "image"
+    FILE = "file"
+    AUDIO = "audio"
+    VIDEO = "video"
+    SYSTEM = "system"
+    CODE = "code"
+    LOCATION = "location"
+    CUSTOM = "custom"
+
+
+class CreateConversationRequest(BaseModel):
+    type: str = Field(default="direct", description="direct|group|channel|support")
+    title: Optional[str] = Field(default=None, max_length=120)
+    participant_ids: List[str] = Field(default_factory=list, description="User IDs to add (excluding creator)")
+    avatar_url: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class AddParticipantsRequest(BaseModel):
+    participant_ids: List[str]
+
+
+class ConversationResponse(BaseModel):
+    id: str
+    type: str
+    title: Optional[str] = None
+    avatar_url: Optional[str] = None
+    created_by: str
+    participants: List[str]
+    participant_count: int
+    last_message: Optional[Dict[str, Any]] = None
+    last_message_at: Optional[str] = None
+    message_count: int = 0
+    created_at: str
+    updated_at: str
+    is_archived: bool = False
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ConversationListResponse(BaseModel):
+    conversations: List[ConversationResponse]
+    total: int
+
+
+class SendMessageRequest(BaseModel):
+    type: str = Field(default="text", description="anytypes: text|image|file|audio|video|system|code|location|custom")
+    content: Optional[str] = Field(default="", max_length=10000)
+    payload: Optional[Dict[str, Any]] = Field(default=None, description="Arbitrary JSON for anytype (file_url, mime, etc)")
+    reply_to: Optional[str] = None
+    temp_id: Optional[str] = Field(default=None, description="Client temp ID for optimistic UI dedup")
+
+
+class EditMessageRequest(BaseModel):
+    content: Optional[str] = Field(default=None, max_length=10000)
+    payload: Optional[Dict[str, Any]] = None
+
+
+class ReactRequest(BaseModel):
+    emoji: str = Field(..., max_length=10)
+
+
+class MessageResponse(BaseModel):
+    id: str
+    conversation_id: str
+    sender_id: str
+    sender_name: Optional[str] = None
+    sender_avatar: Optional[str] = None
+    type: str
+    content: str
+    payload: Optional[Dict[str, Any]] = None
+    reply_to: Optional[str] = None
+    created_at: str
+    edited_at: Optional[str] = None
+    deleted_at: Optional[str] = None
+    reactions: Optional[Dict[str, List[str]]] = None
+    read_by: Optional[List[str]] = None
+    temp_id: Optional[str] = None
+
+
+class MessageListResponse(BaseModel):
+    messages: List[MessageResponse]
+    total: int
+    has_more: bool
+    next_cursor: Optional[str] = None
+
+
+class TypingEvent(BaseModel):
+    conversation_id: str
+    is_typing: bool = True
+
+
+# ==========================================
 # 6. Payments & Subscriptions
 # ==========================================
 

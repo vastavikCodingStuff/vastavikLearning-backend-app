@@ -19,6 +19,8 @@ class RouteStatusManager:
             "payments": True,
             "live_signaling": True,
             "peer_chat": True,
+            "conversations": True,
+            "socketio": True,
             "notes": True,
             "pyq": True,
             "doubts": True,
@@ -82,6 +84,7 @@ class CircuitBreakerMiddleware(BaseHTTPMiddleware):
         "/api/v1/code": "code_execution",
         "/api/v1/payments": "payments",
         "/api/v1/doubts": "doubts",
+        "/api/v1/conversations": "conversations",
     }
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:

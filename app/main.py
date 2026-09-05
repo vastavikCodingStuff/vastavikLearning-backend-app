@@ -18,6 +18,7 @@ from app.routers import (
     ai,
     code,
     realtime,
+    conversations,
     doubts,
     payments,
     notes,
@@ -121,6 +122,7 @@ app.include_router(catalog.router)
 app.include_router(ai.router)
 app.include_router(code.router)
 app.include_router(realtime.router)
+app.include_router(conversations.router)
 app.include_router(doubts.router)
 app.include_router(payments.router)
 app.include_router(notes.router)
@@ -128,6 +130,23 @@ app.include_router(pyq.router)
 app.include_router(search.router)
 app.include_router(system.router)
 app.include_router(admin.router)
+
+# Socket.IO ASGI integration - self-hosted real-time conversations
+# Import here to avoid circular imports; mount only if python-socketio available
+try:
+    import socketio as _socketio  # noqa: F401
+    from app.realtime.socketio_server import sio as _sio
+
+    # Wrap FastAPI app with Socket.IO ASGI app for unified server
+    # Mounted at /socket.io/ - compatible with Web, Android, iOS, Desktop clients
+    # Using socketio.ASGIApp wrapper - create combined ASGI app
+    socket_app = _socketio.ASGIApp(_sio, other_asgi_app=app)
+
+    # Expose for uvicorn: when imported as app.main:socket_app it serves both
+    # But keep `app` as primary for tests; socket_app is alternative entrypoint
+except Exception as _e:
+    # Fallback: Socket.IO not available, continue with REST only
+    socket_app = app
 
 
 @app.get("/health", response_model=HealthResponse, tags=["System & Diagnostics"])

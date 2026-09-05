@@ -49,6 +49,8 @@ class DatabaseRepository:
         self._memory_doubts: List[Dict[str, Any]] = []
         self._memory_bug_reports: List[Dict[str, Any]] = []
         self._memory_fcm_tokens: Dict[str, str] = {}
+        self._memory_conversations: Dict[str, Dict[str, Any]] = {}
+        self._memory_messages: Dict[str, List[Dict[str, Any]]] = {}
         
         # Seed initial catalog data
         self._init_catalog_data()
@@ -450,6 +452,291 @@ class DatabaseRepository:
                 "is_read": False,
             }
         ]
+
+    # ==========================================
+    # Conversations & Messages (anytype)
+    # ==========================================
+
+    def _conv_doc_ref(self, conv_id: str):
+        if self.use_live_firestore:
+            return _firestore_client.collection("conversations").document(conv_id)
+        return None
+
+    def _msg_col_ref(self, conv_id: str):
+        if self.use_live_firestore:
+            return _firestore_client.collection("conversations").document(conv_id).collection("messages")
+        return None
+
+    async def create_conversation(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        conv_id = data.get("id") or f"conv_{uuid.uuid4().hex[:12]}"
+        data["id"] = conv_id
+        now = datetime.now(timezone.utc).isoformat()
+        data.setdefault("created_at", now)
+        data.setdefault("updated_at", now)
+        data.setdefault("message_count", 0)
+        data.setdefault("is_archived", False)
+        if self.use_live_firestore:
+            try:
+                _firestore_client.collection("conversations").document(conv_id).set(data, merge=False)
+            except Exception as e:
+                logger.warning(f"Firestore create_conversation fallback: {e}")
+        # Always mirror to memory for fast fallback reads and index-free queries
+        self._memory_conversations[conv_id] = data
+        self._memory_messages.setdefault(conv_id, [])
+        return data
+
+    async def get_conversation(self, conv_id: str) -> Optional[Dict[str, Any]]:
+        if self.use_live_firestore:
+            try:
+                doc = _firestore_client.collection("conversations").document(conv_id).get()
+                if doc.exists:
+                    d = doc.to_dict()
+                    d["id"] = doc.id
+                    return d
+            except Exception as e:
+                logger.warning(f"Firestore get_conversation error: {e}")
+        return self._memory_conversations.get(conv_id)
+
+    async def list_conversations_for_user(self, uid: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+        if self.use_live_firestore:
+            try:
+                # Try composite query; if index missing, fall back to simpler query + python sort
+                from google.cloud.firestore_v1.base_query import FieldFilter
+                try:
+                    q = _firestore_client.collection("conversations").where(filter=FieldFilter("participants", "array_contains", uid)).order_by("updated_at", direction="DESCENDING").limit(limit + offset).stream()
+                    results = []
+                    for doc in q:
+                        d = doc.to_dict()
+                        d["id"] = doc.id
+                        results.append(d)
+                    if results:
+                        # Merge with in-memory to ensure newly created (mirrored) convs are included if Firestore lags
+                        mem_ids = {c["id"] for c in results}
+                        for mc in self._memory_conversations.values():
+                            if uid in mc.get("participants", []) and mc["id"] not in mem_ids:
+                                results.append(mc)
+                        results.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+                        return results[offset:offset+limit]
+                except Exception as inner:
+                    if "index" in str(inner).lower():
+                        logger.warning(f"Firestore composite index missing, falling back to simple query: {inner}")
+                    # Simple array_contains without ordering (no index needed)
+                    q2 = _firestore_client.collection("conversations").where(filter=FieldFilter("participants", "array_contains", uid)).limit(200).stream()
+                    results2 = []
+                    for doc in q2:
+                        d = doc.to_dict()
+                        d["id"] = doc.id
+                        results2.append(d)
+                    # Merge memory
+                    mem_ids2 = {c["id"] for c in results2}
+                    for mc in self._memory_conversations.values():
+                        if uid in mc.get("participants", []) and mc["id"] not in mem_ids2:
+                            results2.append(mc)
+                    results2.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+                    if results2:
+                        return results2[offset:offset+limit]
+            except Exception as e:
+                logger.warning(f"Firestore list_conversations error: {e}")
+        # Fallback in-memory
+        all_convs = [c for c in self._memory_conversations.values() if uid in c.get("participants", [])]
+        all_convs.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+        return all_convs[offset: offset + limit]
+
+    async def update_conversation(self, conv_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if self.use_live_firestore:
+            try:
+                _firestore_client.collection("conversations").document(conv_id).set(updates, merge=True)
+                doc = _firestore_client.collection("conversations").document(conv_id).get()
+                if doc.exists:
+                    d = doc.to_dict()
+                    d["id"] = doc.id
+                    return d
+            except Exception as e:
+                logger.warning(f"Firestore update_conversation error: {e}")
+        if conv_id in self._memory_conversations:
+            self._memory_conversations[conv_id].update(updates)
+            return self._memory_conversations[conv_id]
+        return None
+
+    async def add_participants(self, conv_id: str, new_ids: List[str]) -> Optional[Dict[str, Any]]:
+        conv = await self.get_conversation(conv_id)
+        if not conv:
+            return None
+        participants = list(set(conv.get("participants", []) + new_ids))
+        return await self.update_conversation(conv_id, {"participants": participants})
+
+    async def remove_participant(self, conv_id: str, uid: str) -> Optional[Dict[str, Any]]:
+        conv = await self.get_conversation(conv_id)
+        if not conv:
+            return None
+        participants = [p for p in conv.get("participants", []) if p != uid]
+        return await self.update_conversation(conv_id, {"participants": participants})
+
+    async def delete_conversation(self, conv_id: str) -> bool:
+        if self.use_live_firestore:
+            try:
+                # Delete subcollection messages (best effort)
+                msgs = _firestore_client.collection("conversations").document(conv_id).collection("messages").stream()
+                for m in msgs:
+                    m.reference.delete()
+                _firestore_client.collection("conversations").document(conv_id).delete()
+            except Exception as e:
+                logger.warning(f"Firestore delete_conversation error: {e}")
+        if conv_id in self._memory_conversations:
+            del self._memory_conversations[conv_id]
+        if conv_id in self._memory_messages:
+            del self._memory_messages[conv_id]
+        return True
+
+    # --- Messages ---
+
+    async def create_message(self, conv_id: str, msg: Dict[str, Any]) -> Dict[str, Any]:
+        msg_id = msg.get("id") or f"msg_{uuid.uuid4().hex[:12]}"
+        msg["id"] = msg_id
+        msg["conversation_id"] = conv_id
+        now = datetime.now(timezone.utc).isoformat()
+        msg.setdefault("created_at", now)
+        msg.setdefault("reactions", {})
+        msg.setdefault("read_by", [])
+        if self.use_live_firestore:
+            try:
+                _firestore_client.collection("conversations").document(conv_id).collection("messages").document(msg_id).set(msg)
+                # Update conversation last_message & counters
+                _firestore_client.collection("conversations").document(conv_id).set({
+                    "last_message": {"id": msg_id, "type": msg.get("type"), "content": msg.get("content","")[:300], "sender_id": msg.get("sender_id"), "created_at": now},
+                    "last_message_at": now,
+                    "updated_at": now,
+                    "message_count": msg.get("_increment", 1),
+                }, merge=True)
+                # Use transaction increment if needed but simple merge
+                try:
+                    # Try increment properly
+                    from firebase_admin import firestore as fs
+                    _firestore_client.collection("conversations").document(conv_id).set({"message_count": fs.Increment(1)}, merge=True)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Firestore create_message error: {e}")
+        # Always mirror to memory for fast reads
+        if conv_id not in self._memory_messages:
+            self._memory_messages[conv_id] = []
+        self._memory_messages[conv_id].append(msg)
+        # Update memory conversation meta as well
+        if conv_id in self._memory_conversations:
+            self._memory_conversations[conv_id]["last_message"] = {"id": msg_id, "type": msg.get("type"), "content": msg.get("content","")[:300], "sender_id": msg.get("sender_id"), "created_at": now}
+            self._memory_conversations[conv_id]["last_message_at"] = now
+            self._memory_conversations[conv_id]["updated_at"] = now
+            self._memory_conversations[conv_id]["message_count"] = self._memory_conversations[conv_id].get("message_count", 0) + 1
+        return msg
+
+    async def get_messages(self, conv_id: str, limit: int = 50, cursor: Optional[str] = None) -> List[Dict[str, Any]]:
+        if self.use_live_firestore:
+            try:
+                col = _firestore_client.collection("conversations").document(conv_id).collection("messages")
+                # Order by created_at desc, handle cursor pagination
+                query = col.order_by("created_at", direction="DESCENDING").limit(limit)
+                # cursor is iso timestamp or msg id - simple implementation: filter
+                docs = list(query.stream())
+                msgs = []
+                for d in docs:
+                    md = d.to_dict()
+                    md["id"] = d.id
+                    msgs.append(md)
+                if msgs:
+                    # If cursor provided, find position and slice after
+                    if cursor:
+                        for idx, m in enumerate(msgs):
+                            if m["id"] == cursor or m.get("created_at") == cursor:
+                                return msgs[idx+1: idx+1+limit]
+                    return msgs
+            except Exception as e:
+                logger.warning(f"Firestore get_messages error: {e}")
+        # Fallback memory: sorted desc
+        msgs = self._memory_messages.get(conv_id, [])
+        # Sort descending by created_at
+        msgs_sorted = sorted(msgs, key=lambda x: x.get("created_at",""), reverse=True)
+        if cursor:
+            try:
+                idx = next(i for i, m in enumerate(msgs_sorted) if m["id"] == cursor or m.get("created_at") == cursor)
+                msgs_sorted = msgs_sorted[idx+1:]
+            except StopIteration:
+                pass
+        return msgs_sorted[:limit]
+
+    async def get_message(self, conv_id: str, msg_id: str) -> Optional[Dict[str, Any]]:
+        if self.use_live_firestore:
+            try:
+                doc = _firestore_client.collection("conversations").document(conv_id).collection("messages").document(msg_id).get()
+                if doc.exists:
+                    d = doc.to_dict()
+                    d["id"] = doc.id
+                    return d
+            except Exception as e:
+                logger.warning(f"Firestore get_message error: {e}")
+        for m in self._memory_messages.get(conv_id, []):
+            if m.get("id") == msg_id:
+                return m
+        return None
+
+    async def update_message(self, conv_id: str, msg_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        updates["edited_at"] = datetime.now(timezone.utc).isoformat()
+        if self.use_live_firestore:
+            try:
+                _firestore_client.collection("conversations").document(conv_id).collection("messages").document(msg_id).set(updates, merge=True)
+            except Exception as e:
+                logger.warning(f"Firestore update_message error: {e}")
+        for m in self._memory_messages.get(conv_id, []):
+            if m.get("id") == msg_id:
+                m.update(updates)
+                return m
+        return None
+
+    async def delete_message(self, conv_id: str, msg_id: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        if self.use_live_firestore:
+            try:
+                _firestore_client.collection("conversations").document(conv_id).collection("messages").document(msg_id).set({"deleted_at": now, "content": "", "payload": None}, merge=True)
+            except Exception as e:
+                logger.warning(f"Firestore delete_message error: {e}")
+        for m in self._memory_messages.get(conv_id, []):
+            if m.get("id") == msg_id:
+                m["deleted_at"] = now
+                m["content"] = ""
+                m["payload"] = None
+                return True
+        return False
+
+    async def add_reaction(self, conv_id: str, msg_id: str, uid: str, emoji: str) -> Optional[Dict[str, Any]]:
+        msg = await self.get_message(conv_id, msg_id)
+        if not msg:
+            return None
+        reactions = msg.get("reactions") or {}
+        if emoji not in reactions:
+            reactions[emoji] = []
+        if uid not in reactions[emoji]:
+            reactions[emoji].append(uid)
+        return await self.update_message(conv_id, msg_id, {"reactions": reactions})
+
+    async def remove_reaction(self, conv_id: str, msg_id: str, uid: str, emoji: str) -> Optional[Dict[str, Any]]:
+        msg = await self.get_message(conv_id, msg_id)
+        if not msg:
+            return None
+        reactions = msg.get("reactions") or {}
+        if emoji in reactions and uid in reactions[emoji]:
+            reactions[emoji].remove(uid)
+            if not reactions[emoji]:
+                del reactions[emoji]
+        return await self.update_message(conv_id, msg_id, {"reactions": reactions})
+
+    async def mark_read(self, conv_id: str, msg_id: str, uid: str) -> Optional[Dict[str, Any]]:
+        msg = await self.get_message(conv_id, msg_id)
+        if not msg:
+            return None
+        read_by = msg.get("read_by") or []
+        if uid not in read_by:
+            read_by.append(uid)
+        return await self.update_message(conv_id, msg_id, {"read_by": read_by})
 
 
 # Global repository instance

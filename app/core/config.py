@@ -69,6 +69,21 @@ class Settings(BaseSettings):
     RATE_LIMIT_CODE: int = 8
     RATE_LIMIT_GENERAL: int = 120
     RATE_LIMIT_WEBRTC: int = 600
+    RATE_LIMIT_CONVERSATIONS: int = 60
+    RATE_LIMIT_SOCKET: int = 300
+
+    # Conversations / Socket.IO
+    SOCKETIO_CORS_ORIGINS: str = "*"  # comma-separated or "*"
+    SOCKETIO_ASYNC_MODE: str = "asgi"
+    MAX_CONVERSATION_PARTICIPANTS: int = 100
+    MAX_MESSAGE_PAYLOAD_KB: int = 64
+    CONVERSATION_HISTORY_PAGE_SIZE: int = 50
+    CONVERSATION_HISTORY_MAX_LIMIT: int = 100
+
+    def get_socketio_cors_origins(self) -> list[str]:
+        if self.SOCKETIO_CORS_ORIGINS.strip() == "*":
+            return ["*"]
+        return [o.strip() for o in self.SOCKETIO_CORS_ORIGINS.split(",") if o.strip()]
 
     # Uploads
     UPLOAD_DIR: str = "./uploads"
