@@ -117,3 +117,5 @@ python -m pytest tests/test_backend.py -v
 - Anytype messages: never assume payload schema - treat as `Dict[str, Any]`
 - Use `file_path:line_number` when referencing code in PRs/reviews
 - Prefer editing existing files over creating new ones; `write` only for new feature modules
+
+<!-- sync: 2026-09-06 verified PR workflow -->
