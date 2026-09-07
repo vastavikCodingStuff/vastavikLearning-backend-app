@@ -517,3 +517,83 @@ def test_admin_dashboard_stats_and_login():
     assert res_v1.status_code == 200
 
 
+def test_user_profile_onboarding_fields():
+    """Verify school, dob, hobbies, and custom board persistence and retrieval."""
+    unique_email = f"onboarding_{int(time.time())}@vastavik.com"
+    signup_payload = {
+        "email": unique_email,
+        "password": "Password123!",
+        "name": "Onboarding Student",
+        "board": "West Bengal Board",
+        "student_class": "Class 11",
+        "school": "St. Xavier's Collegiate School",
+        "dob": "2008-05-15",
+        "hobbies": "Competitive Coding, Chess",
+    }
+    h_signup = client.post("/api/v1/auth/signup", json=signup_payload)
+    assert h_signup.status_code == 200
+    token = h_signup.json()["access_token"]
+
+    # Verify get profile with mobile HMAC headers
+    h_auth = get_hmac_headers("/api/v1/user/profile", "GET")
+    h_auth["Authorization"] = f"Bearer {token}"
+    res_profile = client.get("/api/v1/user/profile", headers=h_auth)
+    assert res_profile.status_code == 200
+    profile = res_profile.json()
+    assert profile["board"] == "West Bengal Board"
+    assert profile["school"] == "St. Xavier's Collegiate School"
+    assert profile["dob"] == "2008-05-15"
+    assert profile["hobbies"] == "Competitive Coding, Chess"
+
+    # Update profile
+    update_payload = {
+        "board": "CBSE",
+        "school": "Delhi Public School",
+        "dob": "2008-05-16",
+        "hobbies": "Robotics, Football",
+    }
+    h_update = get_hmac_headers("/api/v1/user/profile", "PUT")
+    h_update["Authorization"] = f"Bearer {token}"
+    res_update = client.put("/api/v1/user/profile", json=update_payload, headers=h_update)
+    assert res_update.status_code == 200
+    updated = res_update.json()
+    assert updated["board"] == "CBSE"
+    assert updated["school"] == "Delhi Public School"
+    assert updated["dob"] == "2008-05-16"
+    assert updated["hobbies"] == "Robotics, Football"
+
+
+def test_ai_chat_practice_context_retrieval():
+    """Verify that AI tutoring leverages curated Practice sets when queried."""
+    chat_payload = {
+        "prompt": "Explain Predict the Output Set 1 question 1 with loop tracing",
+        "history": [],
+    }
+    h_chat = get_hmac_headers("/api/v1/ai/chat", "POST")
+    res = client.post("/api/v1/ai/chat", json=chat_payload, headers=h_chat)
+    assert res.status_code == 200
+    data = res.json()
+    assert "reply" in data
+    assert "9" in data["reply"]
+    assert "Loop Tracing" in data["reply"] or "sum" in data["reply"].lower()
+
+
+def test_mobile_dev_secret_hmac():
+    """Verify that the Android client's standard secret passes HMAC verification."""
+    import hmac
+    import hashlib
+    ts = str(time.time())
+    method = "GET"
+    path = "/api/v1/health"
+    sig = hmac.new(b"dev-secret-android-32bytes-hex-0000", f"{ts}{method}{path}".encode("utf-8"), hashlib.sha256).hexdigest()
+    mobile_headers = {
+        "x-api-key-id": "dev-key-android-vastavik-001",
+        "x-api-key-secret": "dev-secret-android-32bytes-hex-0000",
+        "x-timestamp": ts,
+        "x-hmac": sig,
+    }
+    res = client.get("/api/v1/health", headers=mobile_headers)
+    assert res.status_code == 200
+
+
+

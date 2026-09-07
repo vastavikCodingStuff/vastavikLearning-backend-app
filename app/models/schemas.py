@@ -10,9 +10,12 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
     name: str = Field(..., min_length=2)
-    board: str = Field(default="ICSE")  # "ICSE" | "CBSE"
+    board: str = Field(default="ICSE")  # "ICSE" | "CBSE" | "West Bengal Board" | "Others"
     language: str = Field(default="Java")  # "Java" | "Python"
     student_class: Optional[str] = Field(default="Class 10")
+    school: Optional[str] = None
+    dob: Optional[str] = None
+    hobbies: Optional[str] = None
     languages: Optional[List[str]] = Field(default_factory=lambda: ["Java", "Python", "JavaScript", "SQL"])
 
 
@@ -20,6 +23,9 @@ class UpdateProfileRequest(BaseModel):
     name: Optional[str] = None
     student_class: Optional[str] = None
     board: Optional[str] = None
+    school: Optional[str] = None
+    dob: Optional[str] = None
+    hobbies: Optional[str] = None
     preferred_language: Optional[str] = None
     languages: Optional[List[str]] = None
 
@@ -68,6 +74,9 @@ class UserProfileResponse(BaseModel):
     is_premium: bool
     board: Optional[str] = "ICSE"
     student_class: Optional[str] = "Class 10"
+    school: Optional[str] = None
+    dob: Optional[str] = None
+    hobbies: Optional[str] = None
     preferred_language: Optional[str] = "Java"
     languages: List[str] = Field(default_factory=lambda: ["Java", "Python", "JavaScript", "SQL"])
     streak_count: int = 0
