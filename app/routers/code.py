@@ -1,12 +1,13 @@
 import logging
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import httpx
 from fastapi import APIRouter, HTTPException, status, Depends
 
 from app.core.config import settings
 from app.core.circuit_breaker import require_route_enabled
 from app.core.rate_limiter import rate_limit
+from app.core.security import get_current_user_optional
 from app.models.schemas import (
     CodeExecutionRequest,
     CodeExecutionResponse,
@@ -32,11 +33,13 @@ LANGUAGE_IDS = {
     response_model=CodeExecutionResponse,
     dependencies=[Depends(require_route_enabled("code_execution")), Depends(rate_limit("code"))]
 )
-async def execute_code(request: CodeExecutionRequest):
+async def execute_code(
+    request: CodeExecutionRequest,
+    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+):
     """
     Proxies code execution to Judge0 runner with a strict 10-second fail-fast timeout.
-    If the remote Judge0 VPS is powered down or unreachable, catches the exception instantly
-    and responds gracefully without blocking the core application server.
+    Saves execution telemetry in Firestore for student history and admin analytics.
     """
     lang_key = request.language.lower().strip()
     language_id = LANGUAGE_IDS.get(lang_key)
@@ -77,6 +80,31 @@ async def execute_code(request: CodeExecutionRequest):
 
                 # Judge0 status 3 = Accepted
                 success = (status_id == 3)
+
+                # Persist execution log for admin dashboard & student telemetry
+                try:
+                    from app.db.firebase import db
+                    from datetime import datetime, timezone
+                    import uuid
+                    exec_id = f"exec_{uuid.uuid4().hex[:10]}"
+                    log_record = {
+                        "id": exec_id,
+                        "uid": current_user.get("sub") or current_user.get("uid") or "anonymous" if current_user else "anonymous",
+                        "student_name": current_user.get("name", "Guest Student") if current_user else "Guest Student",
+                        "language": lang_key,
+                        "source_code": request.source_code[:4000],
+                        "stdout": stdout or "",
+                        "stderr": stderr or "",
+                        "status_description": status_desc,
+                        "execution_time": time_taken,
+                        "memory_kb": memory or 0,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if db.use_live_firestore:
+                        db._firestore_client.collection("code_executions").document(exec_id).set(log_record)
+                except Exception as log_err:
+                    logger.warning(f"Failed to log code execution: {log_err}")
+
                 return CodeExecutionResponse(
                     success=success,
                     stdout=stdout,

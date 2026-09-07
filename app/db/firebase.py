@@ -234,10 +234,10 @@ class DatabaseRepository:
             _firestore_client.collection("users").document(uid).set(updates, merge=True)
             return True
         else:
-            if uid in self._memory_users:
-                self._memory_users[uid].update(updates)
-                return True
-            return False
+            if uid not in self._memory_users:
+                self._memory_users[uid] = {"uid": uid, "name": "Student", "email": "student@vastavik.com", "role": "student"}
+            self._memory_users[uid].update(updates)
+            return True
 
     # --- Catalog & Curriculum ---
 

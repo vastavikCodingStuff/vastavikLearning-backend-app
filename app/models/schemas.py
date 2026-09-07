@@ -12,6 +12,16 @@ class SignupRequest(BaseModel):
     name: str = Field(..., min_length=2)
     board: str = Field(default="ICSE")  # "ICSE" | "CBSE"
     language: str = Field(default="Java")  # "Java" | "Python"
+    student_class: Optional[str] = Field(default="Class 10")
+    languages: Optional[List[str]] = Field(default_factory=lambda: ["Java", "Python", "JavaScript", "SQL"])
+
+
+class UpdateProfileRequest(BaseModel):
+    name: Optional[str] = None
+    student_class: Optional[str] = None
+    board: Optional[str] = None
+    preferred_language: Optional[str] = None
+    languages: Optional[List[str]] = None
 
 
 class LoginRequest(BaseModel):
@@ -57,10 +67,14 @@ class UserProfileResponse(BaseModel):
     role: str
     is_premium: bool
     board: Optional[str] = "ICSE"
+    student_class: Optional[str] = "Class 10"
     preferred_language: Optional[str] = "Java"
+    languages: List[str] = Field(default_factory=lambda: ["Java", "Python", "JavaScript", "SQL"])
     streak_count: int = 0
     lessons_completed: int = 0
+    completion_rate: float = 0.0
     subscription_expires_at: Optional[str] = None
+    payment_details: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # ==========================================
@@ -120,17 +134,35 @@ class LessonResponse(BaseModel):
     description: str
     youtube_url: str
     youtube_video_id: str
-    duration_sec: int
-    whiteboard_image_url: str
-    code_sample: str
-    notes: str
-    is_premium: bool
-    order: int
+    duration_sec: int = 0
+    whiteboard_image_url: Optional[str] = ""
+    code_sample: Optional[str] = ""
+    notes: Optional[str] = ""
+    is_premium: bool = False
+    order: int = 0
+    video_format: str = "screen_recording"  # "screen_recording" | "whiteboard" | "short"
+    shorts_url: Optional[str] = None
+    shorts_video_id: Optional[str] = None
 
 
 class VisitedRequest(BaseModel):
     course_id: str
     part_id: str
+
+
+class CourseProgressResponse(BaseModel):
+    course_id: str
+    course_title: str
+    total_parts: int
+    completed_parts: int
+    completion_percent: float
+    visited_part_ids: List[str] = Field(default_factory=list)
+
+
+class ProgressSummaryResponse(BaseModel):
+    total_courses_enrolled: int
+    overall_completion_percent: float
+    courses: List[CourseProgressResponse] = Field(default_factory=list)
 
 
 # ==========================================
@@ -146,6 +178,7 @@ class ChatRequest(BaseModel):
     prompt: str
     model: Optional[str] = "mistral-god"  # "mistral-god", "gemini-3.7-flash", "gemini-3.6-flash"
     history: Optional[List[ChatHistoryItem]] = []
+    session_id: Optional[str] = None  # Client-provided session ID for continuity
 
 
 class ChatResponse(BaseModel):
@@ -352,6 +385,81 @@ class PYQResponse(BaseModel):
     question: str
     solution: str
     marks: int
+    grade: Optional[str] = "Class 10"
+    source: Optional[str] = "sir"  # "sir" | "board" | "ai"
+
+
+# ==========================================
+# 8. Practice [Practice Sir] Schemas
+# ==========================================
+
+class MCQItemResponse(BaseModel):
+    id: str
+    title: str
+    sub: str
+    question: Optional[str] = None
+    options: List[str] = Field(default_factory=list)
+    correct_index: int = 0
+    explanation: Optional[str] = None
+    subject: str = "Java"
+    topic: str = "OOP"
+    difficulty: str = "Easy"
+    source: str = "sir"  # "sir" | "ai"
+
+
+class CodingItemResponse(BaseModel):
+    id: str
+    title: str
+    difficulty: str
+    topic: str
+    language: str = "java"
+    description: Optional[str] = None
+    starter_code: Optional[str] = None
+    solution_code: Optional[str] = None
+    test_cases: List[Dict[str, str]] = Field(default_factory=list)
+    source: str = "sir"  # "sir" | "ai"
+
+
+class PredictOutputItemResponse(BaseModel):
+    id: str
+    set_number: int
+    title: str
+    topic: str
+    question_count: str
+    difficulty: str
+    code_snippet: str
+    expected_output: Optional[str] = None
+    source: str = "sir"  # "sir" | "ai"
+
+
+class QuizSetResponse(BaseModel):
+    id: str
+    title: str
+    subject: str
+    question_count: int
+    created_at: str
+    course_id: Optional[str] = None
+
+
+# ==========================================
+# 9. AI Session History Schemas
+# ==========================================
+
+class AiSessionItemResponse(BaseModel):
+    session_id: str
+    title: Optional[str] = "AI Tutoring Session"
+    model_used: str
+    message_count: int
+    created_at: str
+    updated_at: str
+
+
+class AiSessionDetailResponse(BaseModel):
+    session_id: str
+    model_used: str
+    messages: List[Dict[str, Any]]
+    created_at: str
+    updated_at: str
 
 
 # ==========================================

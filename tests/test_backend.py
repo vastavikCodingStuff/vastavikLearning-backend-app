@@ -1,4 +1,5 @@
 import time
+import uuid
 import pytest
 from starlette.testclient import TestClient
 
@@ -362,3 +363,118 @@ def test_security_headers():
     assert res.headers.get("x-frame-options") == "DENY"
     assert res.headers.get("x-xss-protection") == "1; mode=block"
     assert res.headers.get("referrer-policy") == "strict-origin-when-cross-origin"
+
+
+def test_practice_sir_endpoints():
+    """Verify student Practice Sir endpoints: MCQs, Coding, Predict Output, and Quiz sets."""
+    # 1. MCQs
+    h = get_hmac_headers("/api/v1/practice/mcq")
+    res = client.get("/api/v1/practice/mcq?subject=Java&source=sir", headers=h)
+    assert res.status_code == 200
+    mcqs = res.json()
+    assert len(mcqs) > 0
+    assert mcqs[0]["source"] == "sir"
+    assert "question" in mcqs[0]
+    assert "options" in mcqs[0]
+    assert "correct_index" in mcqs[0]
+
+    # 2. Coding Exercises
+    h = get_hmac_headers("/api/v1/practice/coding")
+    res = client.get("/api/v1/practice/coding?language=java&source=sir", headers=h)
+    assert res.status_code == 200
+    coding = res.json()
+    assert len(coding) > 0
+    assert "starter_code" in coding[0]
+    assert "test_cases" in coding[0]
+
+    # 3. Predict Output
+    h = get_hmac_headers("/api/v1/practice/predict-output")
+    res = client.get("/api/v1/practice/predict-output?source=sir", headers=h)
+    assert res.status_code == 200
+    po = res.json()
+    assert len(po) > 0
+    assert "code_snippet" in po[0]
+
+    # 4. Quizzes
+    h = get_hmac_headers("/api/v1/practice/quiz")
+    res = client.get("/api/v1/practice/quiz", headers=h)
+    assert res.status_code == 200
+    quizzes = res.json()
+    assert len(quizzes) > 0
+
+
+def test_video_lecture_formats():
+    """Verify that lesson responses contain video_format for all 3 lecture types."""
+    h = get_hmac_headers("/api/v1/lessons/lesson_oop_101")
+    res = client.get("/api/v1/lessons/lesson_oop_101", headers=h)
+    assert res.status_code == 200
+    data = res.json()
+    assert "video_format" in data
+    assert data["video_format"] in ["screen_recording", "whiteboard", "short"]
+    assert "youtube_url" in data
+    assert "whiteboard_image_url" in data
+    assert "code_sample" in data
+
+
+def test_course_completion_and_progress_summary():
+    """Verify course completion calculation and summary progress."""
+    token = create_access_token({"sub": "student_test_123", "email": "test@vastavik.com", "role": "student"})
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Mark part visited
+    h = get_hmac_headers("/api/v1/progress/visited", "POST") | auth_headers
+    res = client.post("/api/v1/progress/visited", json={"course_id": "course_java_icse", "part_id": "part_1"}, headers=h)
+    assert res.status_code == 200
+
+    # 2. Get specific course progress
+    h = get_hmac_headers("/api/v1/courses/course_java_icse/progress") | auth_headers
+    res = client.get("/api/v1/courses/course_java_icse/progress", headers=h)
+    assert res.status_code == 200
+    prog = res.json()
+    assert prog["course_id"] == "course_java_icse"
+    assert prog["completed_parts"] >= 1
+    assert prog["completion_percent"] > 0
+
+    # 3. Get overall progress summary
+    h = get_hmac_headers("/api/v1/progress/summary") | auth_headers
+    res = client.get("/api/v1/progress/summary", headers=h)
+    assert res.status_code == 200
+    summary = res.json()
+    assert "total_courses_enrolled" in summary
+    assert "overall_completion_percent" in summary
+
+
+def test_student_profile_enrichment_and_update():
+    """Verify enriched student details (class, board, languages, payment details, completion rate)."""
+    uid = f"student_prof_{uuid.uuid4().hex[:8]}"
+    token = create_access_token({"sub": uid, "email": f"{uid}@vastavik.com", "role": "student"})
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Get profile
+    h = get_hmac_headers("/api/v1/user/profile") | auth_headers
+    res = client.get("/api/v1/user/profile", headers=h)
+    assert res.status_code == 200
+    prof = res.json()
+    assert "student_class" in prof
+    assert "board" in prof
+    assert "languages" in prof
+    assert "payment_details" in prof
+    assert "completion_rate" in prof
+    assert "Java" in prof["languages"]
+    assert "SQL" in prof["languages"]
+
+    # 2. Update profile
+    h = get_hmac_headers("/api/v1/user/profile", "PUT") | auth_headers
+    update_data = {
+        "student_class": "Class 12",
+        "board": "CBSE",
+        "preferred_language": "Python",
+        "languages": ["Python", "SQL", "JavaScript"]
+    }
+    res = client.put("/api/v1/user/profile", json=update_data, headers=h)
+    assert res.status_code == 200
+    updated = res.json()
+    assert updated["student_class"] == "Class 12"
+    assert updated["board"] == "CBSE"
+    assert updated["preferred_language"] == "Python"
+
