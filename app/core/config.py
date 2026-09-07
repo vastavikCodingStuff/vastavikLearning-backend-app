@@ -58,10 +58,15 @@ class Settings(BaseSettings):
     GITHUB_CLIENT_SECRET: Optional[str] = None
     GOOGLE_CLIENT_ID: Optional[str] = None
 
-    # Payment Gateway
+    # Payment Gateway (legacy)
     PAYMENT_GATEWAY_KEY: Optional[str] = None
     PAYMENT_GATEWAY_SECRET: Optional[str] = None
     PAYMENT_WEBHOOK_SECRET: Optional[str] = None
+
+    # Razorpay
+    RAZORPAY_KEY_ID: Optional[str] = None
+    RAZORPAY_KEY_SECRET: Optional[str] = None
+    RAZORPAY_WEBHOOK_SECRET: Optional[str] = None
 
     # Rate Limiting (Requests / minute)
     RATE_LIMIT_AUTH: int = 5

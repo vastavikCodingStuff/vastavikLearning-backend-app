@@ -40,27 +40,25 @@ def verify_password(plain_password: str, salt: str, stored_hash: str) -> bool:
 # 2. JWT Access & Refresh Token Management
 # ==========================================
 
-def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
-    """Create a short-lived JWT access token (default 15 mins)."""
+def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None, token_version: int = 0) -> str:
     to_encode = data.copy()
     now = datetime.now(timezone.utc)
     if expires_delta:
         expire = now + expires_delta
     else:
         expire = now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire, "iat": now, "type": "access"})
+    to_encode.update({"exp": expire, "iat": now, "type": "access", "tv": token_version})
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
-def create_refresh_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
-    """Create a long-lived JWT refresh token (default 7 days)."""
+def create_refresh_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None, token_version: int = 0) -> str:
     to_encode = data.copy()
     now = datetime.now(timezone.utc)
     if expires_delta:
         expire = now + expires_delta
     else:
         expire = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "iat": now, "type": "refresh"})
+    to_encode.update({"exp": expire, "iat": now, "type": "refresh", "tv": token_version})
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
@@ -86,7 +84,6 @@ def decode_token(token: str) -> Dict[str, Any]:
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
 ) -> Dict[str, Any]:
-    """Extract and verify user claims from Bearer token."""
     if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -100,6 +97,17 @@ async def get_current_user(
             detail="Invalid token type",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    uid = payload.get("sub")
+    tv = payload.get("tv", 0)
+    if uid:
+        from app.services.device_service import REVOKED_TOKEN_VERSIONS
+        current_tv = REVOKED_TOKEN_VERSIONS.get(uid, 0)
+        if tv < current_tv:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session revoked. Please log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
     return payload
 
 

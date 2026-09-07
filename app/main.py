@@ -29,6 +29,7 @@ from app.routers import (
     admin,
     admin_dashboard,
     activity,
+    growth,
 )
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -97,6 +98,7 @@ async def hmac_verification_middleware(request: Request, call_next):
         "/api/v1/auth",
         "/auth",
         "/admin",
+        "/api/v1/payments/razorpay/webhook",
         "/uploads",
         "/socket.io",
         "/ws",
@@ -141,6 +143,8 @@ app.include_router(admin_dashboard.router)
 app.include_router(admin.router, prefix="/api/v1")
 app.include_router(admin_dashboard.router, prefix="/api/v1")
 app.include_router(activity.router)
+app.include_router(growth.router)
+app.include_router(growth.admin_router, prefix="/api/v1")
 
 # Enable Gzip compression (minimum 1KB) for fast network transfer & low bandwidth usage
 app.add_middleware(GZipMiddleware, minimum_size=1000)
