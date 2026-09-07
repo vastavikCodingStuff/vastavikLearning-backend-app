@@ -25,6 +25,7 @@ from app.models.schemas import (
     DeviceVerifyRequest,
     AuthResponse,
     UserProfileResponse,
+    UpdateProfileRequest,
     CommonResponse,
 )
 
@@ -57,6 +58,8 @@ async def signup(request: SignupRequest):
         "role": "student",
         "board": request.board,
         "preferred_language": request.language,
+        "student_class": request.student_class or "Class 10",
+        "languages": request.languages or ["Java", "Python", "JavaScript", "SQL"],
         "is_premium": False,
         "subscription_expires_at": None,
         "streak_count": 1,
@@ -305,18 +308,51 @@ async def device_verify(request: DeviceVerifyRequest):
 @router.get("/user/profile", response_model=UserProfileResponse)
 async def get_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
-    Fetches the authenticated student's profile details.
+    Fetches the authenticated student's profile details including:
+    name, class, board, language skills (Java, Python, JS, SQL), completion rate, and payment details.
     """
     uid = current_user.get("sub")
     user = await db.get_user_by_id(uid)
+
+    # Fetch payment transactions
+    payment_records = []
+    try:
+        if db.use_live_firestore:
+            txns = db._firestore_client.collection("transactions").where("uid", "==", uid).stream()
+            payment_records = [t.to_dict() for t in txns]
+    except Exception:
+        pass
+
+    # Compute student course completion percentage
+    completion_rate = 0.0
+    try:
+        visited = await db.get_visited_parts(uid)
+        catalog = await db.get_home_catalog()
+        courses = catalog.get("courses", [])
+        if courses and visited:
+            total_parts_count = 0
+            for c in courses:
+                parts = await db.get_course_curriculum(c.get("id", ""))
+                total_parts_count += len(parts)
+            if total_parts_count > 0:
+                completion_rate = round((len(visited) / total_parts_count) * 100.0, 1)
+    except Exception:
+        pass
+
     if not user:
-        # Return claims-based fallback if user is admin
+        # Return claims-based fallback if user is admin or master
         return UserProfileResponse(
             user_id=uid,
             name=current_user.get("name", "User"),
             email=current_user.get("email", ""),
             role=current_user.get("role", "student"),
             is_premium=True,
+            student_class="Class 10",
+            board="ICSE",
+            preferred_language="Java",
+            languages=["Java", "Python", "JavaScript", "SQL"],
+            completion_rate=completion_rate,
+            payment_details=payment_records,
         )
 
     return UserProfileResponse(
@@ -326,8 +362,44 @@ async def get_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
         role=user.get("role", "student"),
         is_premium=user.get("is_premium", False),
         board=user.get("board", "ICSE"),
+        student_class=user.get("student_class", "Class 10"),
         preferred_language=user.get("preferred_language", "Java"),
+        languages=user.get("languages", ["Java", "Python", "JavaScript", "SQL"]),
         streak_count=user.get("streak_count", 0),
         lessons_completed=user.get("total_lessons_completed", 0),
+        completion_rate=completion_rate,
         subscription_expires_at=user.get("subscription_expires_at"),
+        payment_details=payment_records,
     )
+
+
+@router.put("/user/profile", response_model=UserProfileResponse)
+async def update_profile(
+    request: UpdateProfileRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Updates student details: name, student_class, board, preferred_language, and language skill proficiencies.
+    """
+    uid = current_user.get("sub")
+    updates: Dict[str, Any] = {}
+    if request.name is not None:
+        updates["name"] = request.name
+    if request.student_class is not None:
+        updates["student_class"] = request.student_class
+    if request.board is not None:
+        updates["board"] = request.board
+    if request.preferred_language is not None:
+        updates["preferred_language"] = request.preferred_language
+    if request.languages is not None:
+        updates["languages"] = request.languages
+
+    if updates:
+        try:
+            await db.update_user(uid, updates)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to update profile: {e}")
+
+    # Return refreshed profile
+    return await get_profile(current_user=current_user)
+

@@ -23,10 +23,13 @@ from app.routers import (
     payments,
     notes,
     pyq,
+    practice,
     search,
     system,
     admin,
+    admin_dashboard,
 )
+from starlette.middleware.gzip import GZipMiddleware
 
 SERVER_START_TIME = time.time()
 
@@ -127,9 +130,14 @@ app.include_router(doubts.router)
 app.include_router(payments.router)
 app.include_router(notes.router)
 app.include_router(pyq.router)
+app.include_router(practice.router)
 app.include_router(search.router)
 app.include_router(system.router)
 app.include_router(admin.router)
+app.include_router(admin_dashboard.router)
+
+# Enable Gzip compression (minimum 1KB) for fast network transfer & low bandwidth usage
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Socket.IO ASGI integration - self-hosted real-time conversations
 # Import here to avoid circular imports; mount only if python-socketio available

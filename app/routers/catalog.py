@@ -2,7 +2,7 @@ import time
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, status, Depends
 
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_optional
 from app.core.rate_limiter import rate_limit
 from app.db.firebase import db
 from app.models.schemas import (
@@ -11,6 +11,8 @@ from app.models.schemas import (
     LessonResponse,
     VisitedRequest,
     CommonResponse,
+    CourseProgressResponse,
+    ProgressSummaryResponse,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["Courses & Curriculum"])
@@ -49,9 +51,12 @@ async def get_curriculum(course_id: str):
 
 
 @router.get("/lessons/{lesson_id}", response_model=LessonResponse, dependencies=[Depends(rate_limit("general"))])
-async def get_lesson(lesson_id: str, current_user: Optional[Dict[str, Any]] = Depends(get_current_user)):
+async def get_lesson(lesson_id: str, current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)):
     """
-    Returns lesson content and metadata.
+    Returns lesson content and metadata across 3 lecture formats:
+    - screen_recording: Computer screen / VS Code coding sessions
+    - whiteboard: Conceptual whiteboard explanations
+    - short: Quick vertical 1-2 minute high-yield shorts
     Enforces premium access check for protected masterclass lessons.
     """
     lesson = await db.get_lesson(lesson_id)
@@ -73,6 +78,11 @@ async def get_lesson(lesson_id: str, current_user: Optional[Dict[str, Any]] = De
                 detail="This lesson is part of Vastavik Pro. Please upgrade to unlock.",
             )
 
+    # Normalize format for Android client (vscode -> screen_recording)
+    fmt = lesson.get("video_format") or lesson.get("videoFormat") or "screen_recording"
+    if fmt == "vscode":
+        fmt = "screen_recording"
+    lesson["video_format"] = fmt
     return lesson
 
 
@@ -84,3 +94,73 @@ async def mark_visited(request: VisitedRequest, current_user: Dict[str, Any] = D
     uid = current_user.get("sub")
     await db.mark_visited(uid, request.course_id, request.part_id)
     return CommonResponse(success=True, message=f"Part {request.part_id} marked as completed.")
+
+
+@router.get("/courses/{course_id}/progress", response_model=CourseProgressResponse)
+async def get_course_progress(course_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Calculates student completion rate for a specific course.
+    """
+    uid = current_user.get("sub")
+    parts = await db.get_course_curriculum(course_id)
+    total_parts = len(parts)
+
+    visited_all = await db.get_visited_parts(uid)
+    prefix = f"{course_id}::"
+    course_visited = [p for p in visited_all if p.startswith(prefix)]
+    completed_count = len(course_visited)
+
+    percent = round((completed_count / total_parts * 100.0), 1) if total_parts > 0 else 0.0
+
+    return CourseProgressResponse(
+        course_id=course_id,
+        course_title=course_id.replace("course_", "").replace("_", " ").title(),
+        total_parts=total_parts,
+        completed_parts=completed_count,
+        completion_percent=percent,
+        visited_part_ids=course_visited,
+    )
+
+
+@router.get("/progress/summary", response_model=ProgressSummaryResponse)
+async def get_progress_summary(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Aggregates overall course completion rates for the authenticated student.
+    Fast zero-copy in-memory calculation.
+    """
+    uid = current_user.get("sub")
+    catalog = await db.get_home_catalog()
+    courses = catalog.get("courses", [])
+
+    visited_all = await db.get_visited_parts(uid)
+    course_progress_list = []
+    total_percent_sum = 0.0
+
+    for c in courses:
+        cid = c.get("id", "")
+        parts = await db.get_course_curriculum(cid)
+        total_parts = len(parts)
+        prefix = f"{cid}::"
+        course_visited = [p for p in visited_all if p.startswith(prefix)]
+        completed_count = len(course_visited)
+        percent = round((completed_count / total_parts * 100.0), 1) if total_parts > 0 else 0.0
+
+        course_progress_list.append(
+            CourseProgressResponse(
+                course_id=cid,
+                course_title=c.get("title", cid),
+                total_parts=total_parts,
+                completed_parts=completed_count,
+                completion_percent=percent,
+                visited_part_ids=course_visited,
+            )
+        )
+        total_percent_sum += percent
+
+    overall = round(total_percent_sum / len(courses), 1) if courses else 0.0
+
+    return ProgressSummaryResponse(
+        total_courses_enrolled=len(courses),
+        overall_completion_percent=overall,
+        courses=course_progress_list,
+    )

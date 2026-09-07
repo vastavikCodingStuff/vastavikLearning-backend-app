@@ -6,7 +6,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Form
 
 from app.core.config import settings
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_optional
 from app.core.rate_limiter import rate_limit
 from app.db.firebase import db
 from app.models.schemas import AppUpdateResponse, FcmTokenRequest, CommonResponse
@@ -26,7 +26,7 @@ async def report_bug(
     category: str = Form(default="General"),
     device_diagnostics: str = Form(default="{}"),
     media: Optional[List[UploadFile]] = File(None),
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user),
+    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
 ):
     """
     Accepts multipart bug report with device diagnostics and screenshot/log attachments.

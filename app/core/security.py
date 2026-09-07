@@ -113,6 +113,22 @@ async def require_admin_user(current_user: Dict[str, Any] = Depends(get_current_
     return current_user
 
 
+async def get_current_user_optional(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
+) -> Optional[Dict[str, Any]]:
+    """Like get_current_user but returns None instead of raising 401 if no token present.
+    Used for optional auth on endpoints that work for both authenticated and anonymous users."""
+    if not credentials:
+        return None
+    try:
+        payload = decode_token(credentials.credentials)
+        if payload.get("type") != "access":
+            return None
+        return payload
+    except Exception:
+        return None
+
+
 # ==========================================
 # 3. Dual-Layer HMAC-SHA256 Verification
 # ==========================================
