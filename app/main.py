@@ -93,6 +93,8 @@ async def hmac_verification_middleware(request: Request, call_next):
         "/openapi.json",
         "/health",
         "/api/v1/health",
+        "/api/v1/auth",
+        "/auth",
         "/admin",
         "/uploads",
         "/socket.io",

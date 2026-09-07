@@ -57,6 +57,9 @@ async def signup(request: SignupRequest):
         "salt": salt,
         "role": "student",
         "board": request.board,
+        "school": request.school,
+        "dob": request.dob,
+        "hobbies": request.hobbies,
         "preferred_language": request.language,
         "student_class": request.student_class or "Class 10",
         "languages": request.languages or ["Java", "Python", "JavaScript", "SQL"],
@@ -354,6 +357,9 @@ async def get_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
             is_premium=True,
             student_class="Class 10",
             board="ICSE",
+            school=None,
+            dob=None,
+            hobbies=None,
             preferred_language="Java",
             languages=["Java", "Python", "JavaScript", "SQL"],
             completion_rate=completion_rate,
@@ -368,6 +374,9 @@ async def get_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
         is_premium=user.get("is_premium", False),
         board=user.get("board", "ICSE"),
         student_class=user.get("student_class", "Class 10"),
+        school=user.get("school"),
+        dob=user.get("dob"),
+        hobbies=user.get("hobbies"),
         preferred_language=user.get("preferred_language", "Java"),
         languages=user.get("languages", ["Java", "Python", "JavaScript", "SQL"]),
         streak_count=user.get("streak_count", 0),
@@ -384,7 +393,7 @@ async def update_profile(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Updates student details: name, student_class, board, preferred_language, and language skill proficiencies.
+    Updates student details: name, student_class, board, school, dob, hobbies, preferred_language, and language skill proficiencies.
     """
     uid = current_user.get("sub")
     updates: Dict[str, Any] = {}
@@ -394,6 +403,12 @@ async def update_profile(
         updates["student_class"] = request.student_class
     if request.board is not None:
         updates["board"] = request.board
+    if request.school is not None:
+        updates["school"] = request.school
+    if request.dob is not None:
+        updates["dob"] = request.dob
+    if request.hobbies is not None:
+        updates["hobbies"] = request.hobbies
     if request.preferred_language is not None:
         updates["preferred_language"] = request.preferred_language
     if request.languages is not None:

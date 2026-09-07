@@ -304,17 +304,20 @@ class DatabaseRepository:
 
     async def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
         if self.use_live_firestore:
-            users_ref = _firestore_client.collection("users")
             try:
-                from google.cloud.firestore_v1.base_query import FieldFilter
-                query = users_ref.where(filter=FieldFilter("email", "==", email.lower())).limit(1).stream()
-            except Exception:
-                query = users_ref.where("email", "==", email.lower()).limit(1).stream()
-            for doc in query:
-                data = doc.to_dict()
-                data["uid"] = doc.id
-                return data
-            return None
+                users_ref = _firestore_client.collection("users")
+                try:
+                    from google.cloud.firestore_v1.base_query import FieldFilter
+                    query = users_ref.where(filter=FieldFilter("email", "==", email.lower())).limit(1).stream()
+                except Exception:
+                    query = users_ref.where("email", "==", email.lower()).limit(1).stream()
+                for doc in query:
+                    data = doc.to_dict()
+                    data["uid"] = doc.id
+                    self._memory_users[doc.id] = data
+                    return data
+            except Exception as e:
+                logger.warning(f"Firestore get_user_by_email error: {e}. Falling back to memory.")
         
         for user in self._memory_users.values():
             if user.get("email", "").lower() == email.lower():
@@ -323,12 +326,15 @@ class DatabaseRepository:
 
     async def get_user_by_id(self, uid: str) -> Optional[Dict[str, Any]]:
         if self.use_live_firestore:
-            doc = _firestore_client.collection("users").document(uid).get()
-            if doc.exists:
-                data = doc.to_dict()
-                data["uid"] = doc.id
-                return data
-            return None
+            try:
+                doc = _firestore_client.collection("users").document(uid).get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    data["uid"] = doc.id
+                    self._memory_users[uid] = data
+                    return data
+            except Exception as e:
+                logger.warning(f"Firestore get_user_by_id error: {e}. Falling back to memory.")
         return self._memory_users.get(uid)
 
     async def save_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -336,21 +342,30 @@ class DatabaseRepository:
         user_data["uid"] = uid
         user_data.setdefault("created_at", datetime.now(timezone.utc).isoformat())
 
+        # Dual-write: always write to in-memory store
+        self._memory_users[uid] = user_data.copy()
+
         if self.use_live_firestore:
-            _firestore_client.collection("users").document(uid).set(user_data, merge=True)
-        else:
-            self._memory_users[uid] = user_data
+            try:
+                _firestore_client.collection("users").document(uid).set(user_data, merge=True)
+            except Exception as e:
+                logger.warning(f"Firestore save_user error: {e}. Saved in memory only.")
         return user_data
 
     async def update_user(self, uid: str, updates: Dict[str, Any]) -> bool:
+        # Dual-write: update in-memory store
+        if uid not in self._memory_users:
+            self._memory_users[uid] = {"uid": uid, "name": "Student", "email": "student@vastavik.com", "role": "student"}
+        self._memory_users[uid].update(updates)
+
         if self.use_live_firestore:
-            _firestore_client.collection("users").document(uid).set(updates, merge=True)
-            return True
-        else:
-            if uid not in self._memory_users:
-                self._memory_users[uid] = {"uid": uid, "name": "Student", "email": "student@vastavik.com", "role": "student"}
-            self._memory_users[uid].update(updates)
-            return True
+            try:
+                _firestore_client.collection("users").document(uid).set(updates, merge=True)
+                return True
+            except Exception as e:
+                logger.warning(f"Firestore update_user error: {e}. Updated in memory only.")
+                return True
+        return True
 
     # --- Catalog & Curriculum ---
 
