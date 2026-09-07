@@ -126,6 +126,7 @@ class DatabaseRepository:
         self._memory_fcm_tokens: Dict[str, str] = {}
         self._memory_conversations: Dict[str, Dict[str, Any]] = {}
         self._memory_messages: Dict[str, List[Dict[str, Any]]] = {}
+        self._memory_activity_logs: Dict[str, List[Dict[str, Any]]] = {}
         
         # Seed initial catalog data
         self._init_catalog_data()
@@ -559,6 +560,50 @@ class DatabaseRepository:
         else:
             self._memory_bug_reports.append(report)
         return report
+
+    # --- Activity Logs (Android client telemetry) ---
+
+    async def save_activity_log(self, entry: Dict[str, Any]) -> None:
+        """Persist a single activity log entry. Best-effort; mirrors to in-memory."""
+        uid = entry.get("uid") or "anonymous"
+        entry_id = entry.get("id") or str(uuid.uuid4())
+        entry["id"] = entry_id
+        entry.setdefault("received_at", datetime.now(timezone.utc).isoformat())
+
+        if self.use_live_firestore:
+            try:
+                _firestore_client.collection("activity_logs").document(entry_id).set(entry, merge=True)
+            except Exception as e:
+                logger.warning(f"Firestore save_activity_log failed: {e}. Falling back to memory.")
+
+        bucket = self._memory_activity_logs.setdefault(uid, [])
+        bucket.append(entry)
+        # Cap per-user in-memory log to 1000 entries.
+        if len(bucket) > 1000:
+            del bucket[: len(bucket) - 1000]
+
+    async def list_activity_logs(self, uid: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """List recent activity log entries for a user, newest first."""
+        items: List[Dict[str, Any]] = []
+        if self.use_live_firestore:
+            try:
+                docs = (
+                    _firestore_client.collection("activity_logs")
+                    .where("uid", "==", uid)
+                    .limit(limit)
+                    .stream()
+                )
+                for d in docs:
+                    payload = d.to_dict() or {}
+                    payload["id"] = d.id
+                    items.append(payload)
+            except Exception as e:
+                logger.warning(f"Firestore list_activity_logs failed: {e}. Falling back to memory.")
+        if not items:
+            items = list(self._memory_activity_logs.get(uid, []))
+        # newest first
+        items.sort(key=lambda x: x.get("timestamp_ms") or 0, reverse=True)
+        return items[:limit]
 
     # --- Notifications & FCM ---
 
