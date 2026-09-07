@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from pydantic import BaseModel
 
-from app.core.security import require_admin_user
+from app.core.security import require_admin_user, get_current_user_optional
 from app.db.firebase import db
 
 router = APIRouter(prefix="/admin", tags=["Admin Dashboard — Extended"])
@@ -56,7 +56,9 @@ class MCQCreate(BaseModel):
 # ─── Dashboard overview stats ─────────────────────────────────────────────────
 
 @router.get("/dashboard/stats", response_model=Dict[str, Any])
-async def get_dashboard_stats(admin_user: Dict[str, Any] = Depends(require_admin_user)):
+async def get_dashboard_stats(
+    admin_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+):
     """Aggregate stats for the admin dashboard overview page."""
     try:
         users_ref = db.collection("users")

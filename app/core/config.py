@@ -37,7 +37,7 @@ class Settings(BaseSettings):
 
     # Default Admin
     ADMIN_EMAIL: str = "admin@vastaviklearning.com"
-    ADMIN_PASSWORD: str = "admin@admin123"
+    ADMIN_PASSWORD: str = "change_this_admin_password_123!"
 
     # Judge0 External Code Runner
     JUDGE0_URL: str = "http://139.84.172.230:2358"

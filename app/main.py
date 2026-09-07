@@ -135,6 +135,8 @@ app.include_router(search.router)
 app.include_router(system.router)
 app.include_router(admin.router)
 app.include_router(admin_dashboard.router)
+app.include_router(admin.router, prefix="/api/v1")
+app.include_router(admin_dashboard.router, prefix="/api/v1")
 
 # Enable Gzip compression (minimum 1KB) for fast network transfer & low bandwidth usage
 app.add_middleware(GZipMiddleware, minimum_size=1000)

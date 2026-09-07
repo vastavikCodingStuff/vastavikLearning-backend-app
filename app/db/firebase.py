@@ -35,6 +35,80 @@ except Exception as e:
     logger.warning(f"Could not initialize Firebase Firestore: {e}. Falling back to in-memory store.")
 
 
+class InMemoryDocSnap:
+    def __init__(self, doc_id: str, data: Optional[Dict[str, Any]]):
+        self.id = doc_id
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self._data.copy() if self._data is not None else {}
+
+
+class InMemoryDocRef:
+    def __init__(self, coll: "InMemoryCollection", doc_id: str):
+        self.coll = coll
+        self.id = doc_id
+
+    def get(self) -> InMemoryDocSnap:
+        data = self.coll._docs.get(self.id)
+        return InMemoryDocSnap(self.id, data)
+
+    def set(self, data: Dict[str, Any], merge: bool = False):
+        if merge and self.id in self.coll._docs:
+            self.coll._docs[self.id].update(data)
+        else:
+            self.coll._docs[self.id] = data.copy()
+
+    def update(self, data: Dict[str, Any]):
+        if self.id in self.coll._docs:
+            self.coll._docs[self.id].update(data)
+        else:
+            self.coll._docs[self.id] = data.copy()
+
+    def delete(self):
+        self.coll._docs.pop(self.id, None)
+
+    def collection(self, sub_name: str) -> "InMemoryCollection":
+        key = f"{self.coll.name}/{self.id}/{sub_name}"
+        return self.coll.repo.collection(key)
+
+
+class InMemoryCollection:
+    def __init__(self, repo: "DatabaseRepository", name: str):
+        self.repo = repo
+        self.name = name
+        if name not in repo._memory_collections:
+            repo._memory_collections[name] = {}
+        self._docs = repo._memory_collections[name]
+
+    def document(self, doc_id: Optional[str] = None) -> InMemoryDocRef:
+        if not doc_id:
+            doc_id = str(uuid.uuid4())
+        return InMemoryDocRef(self, doc_id)
+
+    def where(self, field: str, op: str, value: Any) -> "InMemoryCollection":
+        filtered: Dict[str, Dict[str, Any]] = {}
+        for doc_id, data in self._docs.items():
+            val = data.get(field)
+            match = False
+            if op == "==" and val == value:
+                match = True
+            elif op == "!=" and val != value:
+                match = True
+            elif op == "in" and isinstance(value, list) and val in value:
+                match = True
+            if match:
+                filtered[doc_id] = data
+        new_coll = InMemoryCollection(self.repo, f"{self.name}_filtered_{uuid.uuid4().hex[:6]}")
+        new_coll._docs = filtered
+        return new_coll
+
+    def stream(self):
+        for doc_id, data in list(self._docs.items()):
+            yield InMemoryDocSnap(doc_id, data)
+
+
 class DatabaseRepository:
     """
     Unified database repository supporting both live Google Firebase Firestore
@@ -42,6 +116,7 @@ class DatabaseRepository:
     """
     def __init__(self):
         self.use_live_firestore = _firebase_initialized and _firestore_client is not None
+        self._memory_collections: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._memory_users: Dict[str, Dict[str, Any]] = {}
         self._memory_notes: Dict[str, List[Dict[str, Any]]] = {}
         self._memory_progress: Dict[str, List[str]] = {}
@@ -54,6 +129,11 @@ class DatabaseRepository:
         
         # Seed initial catalog data
         self._init_catalog_data()
+
+    def collection(self, name: str):
+        if self.use_live_firestore and _firestore_client is not None:
+            return _firestore_client.collection(name)
+        return InMemoryCollection(self, name)
 
     def _init_catalog_data(self):
         self._courses = [
@@ -186,6 +266,39 @@ class DatabaseRepository:
                 "marks": 2
             }
         ]
+
+        # Seed in-memory collections for admin dashboard and testing
+        for c in self._courses:
+            self._memory_collections.setdefault("courses", {})[c["id"]] = c
+
+        self._memory_collections.setdefault("users", {})["student_demo_1"] = {
+            "uid": "student_demo_1",
+            "name": "Arjun Sharma",
+            "email": "arjun@example.com",
+            "role": "student",
+            "preferred_language": "Java",
+            "student_class": "Class 10",
+            "board": "ICSE",
+            "languages": ["Java", "SQL"],
+        }
+        self._memory_collections.setdefault("users", {})["student_demo_2"] = {
+            "uid": "student_demo_2",
+            "name": "Priya Patel",
+            "email": "priya@example.com",
+            "role": "student",
+            "preferred_language": "Python",
+            "student_class": "Class 12",
+            "board": "CBSE",
+            "languages": ["Python", "JavaScript"],
+        }
+        self._memory_collections.setdefault("bug_reports", {})
+        self._memory_collections.setdefault("ai_chat_sessions", {})
+        self._memory_collections.setdefault("code_executions", {})
+        self._memory_collections.setdefault("practice_quizzes", {})
+        self._memory_collections.setdefault("quiz_questions", {})
+        self._memory_collections.setdefault("coding_exercises", {})
+        self._memory_collections.setdefault("mcqs", {})
+        self._memory_collections.setdefault("videos", {})
 
     # --- User Operations ---
 
