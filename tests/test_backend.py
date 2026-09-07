@@ -478,3 +478,42 @@ def test_student_profile_enrichment_and_update():
     assert updated["board"] == "CBSE"
     assert updated["preferred_language"] == "Python"
 
+
+def test_admin_dashboard_stats_and_login():
+    """Verify admin login with default credentials and dashboard stats access."""
+    # 1. Admin login with default password
+    h_login = get_hmac_headers("/api/v1/auth/login", "POST")
+    login_payload = {
+        "email": "admin@vastaviklearning.com",
+        "password": "change_this_admin_password_123!",
+    }
+    res_login = client.post("/api/v1/auth/login", json=login_payload, headers=h_login)
+    assert res_login.status_code == 200
+    auth_data = res_login.json()
+    assert auth_data["role"] == "admin"
+    admin_token = auth_data["access_token"]
+
+    # 2. Get /admin/dashboard/stats with token
+    h_stats = get_hmac_headers("/admin/dashboard/stats") | {"Authorization": f"Bearer {admin_token}"}
+    res_stats = client.get("/admin/dashboard/stats", headers=h_stats)
+    assert res_stats.status_code == 200
+    stats = res_stats.json()
+    assert "total_students" in stats
+    assert "total_courses" in stats
+    assert "active_ai_sessions" in stats
+    assert "open_bug_reports" in stats
+    assert "code_executions_today" in stats
+    assert "language_distribution" in stats
+
+    # 3. Get /admin/dashboard/stats without token (fallback preview)
+    h_no_auth = get_hmac_headers("/admin/dashboard/stats")
+    res_no_auth = client.get("/admin/dashboard/stats", headers=h_no_auth)
+    assert res_no_auth.status_code == 200
+    assert "total_students" in res_no_auth.json()
+
+    # 4. Get /api/v1/admin/dashboard/stats alias
+    h_v1 = get_hmac_headers("/api/v1/admin/dashboard/stats")
+    res_v1 = client.get("/api/v1/admin/dashboard/stats", headers=h_v1)
+    assert res_v1.status_code == 200
+
+
