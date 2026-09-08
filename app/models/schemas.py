@@ -10,13 +10,18 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
     name: str = Field(..., min_length=2)
-    board: str = Field(default="ICSE")  # "ICSE" | "CBSE" | "West Bengal Board" | "Others"
-    language: str = Field(default="Java")  # "Java" | "Python"
+    board: str = Field(default="ICSE")
+    language: str = Field(default="Java")
     student_class: Optional[str] = Field(default="Class 10")
     school: Optional[str] = None
     dob: Optional[str] = None
     hobbies: Optional[str] = None
     languages: Optional[List[str]] = Field(default_factory=lambda: ["Java", "Python", "JavaScript", "SQL"])
+    referral_code: Optional[str] = None
+    share_token: Optional[str] = None
+    device_fingerprint: Optional[str] = None
+    device_name: Optional[str] = None
+    platform: Optional[str] = None
 
 
 class UpdateProfileRequest(BaseModel):

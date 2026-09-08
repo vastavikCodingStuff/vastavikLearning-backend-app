@@ -16,6 +16,7 @@ from app.core.security import (
 )
 from app.core.rate_limiter import rate_limit
 from app.db.firebase import db
+from app.services.device_service import bind_device, get_token_version
 from app.models.schemas import (
     SignupRequest,
     LoginRequest,
@@ -67,13 +68,36 @@ async def signup(request: SignupRequest):
         "subscription_expires_at": None,
         "streak_count": 1,
         "total_lessons_completed": 0,
+        "credit_balance": 0.0,
+        "access_type": "free",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.save_user(user_data)
 
+    if request.referral_code:
+        try:
+            from app.services.growth_service import attribute_referral_on_signup
+            await attribute_referral_on_signup(uid, request.referral_code.strip().upper(), request.device_fingerprint or "")
+        except Exception:
+            pass
+    elif request.share_token:
+        try:
+            from app.services.growth_service import attribute_share_on_signup
+            await attribute_share_on_signup(uid, request.share_token.strip())
+        except Exception:
+            pass
+
+    if request.device_fingerprint:
+        try:
+            from app.services.device_service import bind_device
+            await bind_device(uid, request.device_fingerprint, request.device_name or "", request.platform or "")
+        except Exception:
+            pass
+
+    tv = await get_token_version(uid)
     token_payload = {"sub": uid, "email": request.email, "role": "student", "name": request.name}
-    access_token = create_access_token(token_payload)
-    refresh_token = create_refresh_token(token_payload)
+    access_token = create_access_token(token_payload, token_version=tv)
+    refresh_token = create_refresh_token(token_payload, token_version=tv)
 
     return AuthResponse(
         success=True,
@@ -88,10 +112,6 @@ async def signup(request: SignupRequest):
 
 @router.post("/auth/login", response_model=AuthResponse, dependencies=[Depends(rate_limit("auth"))])
 async def login(request: LoginRequest):
-    """
-    Authenticates user credentials using constant-time SHA-256 salted hash comparison.
-    """
-    # Check default admin login override if configured
     valid_admin_passwords = {
         settings.ADMIN_PASSWORD,
         "change_this_admin_password_123!",
@@ -127,20 +147,26 @@ async def login(request: LoginRequest):
             detail="Invalid email or password.",
         )
 
+    uid = user["uid"]
+    device_fp = request.device_fingerprint
+    if device_fp:
+        await bind_device(uid, device_fp)
+
+    tv = await get_token_version(uid)
     token_payload = {
-        "sub": user["uid"],
+        "sub": uid,
         "email": user["email"],
         "role": user.get("role", "student"),
         "name": user.get("name", "Student"),
     }
-    access_token = create_access_token(token_payload)
-    refresh_token = create_refresh_token(token_payload)
+    access_token = create_access_token(token_payload, token_version=tv)
+    refresh_token = create_refresh_token(token_payload, token_version=tv)
 
     return AuthResponse(
         success=True,
         access_token=access_token,
         refresh_token=refresh_token,
-        user_id=user["uid"],
+        user_id=uid,
         name=user.get("name"),
         email=user["email"],
         role=user.get("role", "student"),
@@ -162,13 +188,14 @@ async def refresh_token(request: RefreshTokenRequest):
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
+    tv = await get_token_version(uid)
     token_payload = {
         "sub": user["uid"],
         "email": user["email"],
         "role": user.get("role", "student"),
         "name": user.get("name", "Student"),
     }
-    new_access_token = create_access_token(token_payload)
+    new_access_token = create_access_token(token_payload, token_version=tv)
     return AuthResponse(
         success=True,
         access_token=new_access_token,
@@ -221,10 +248,11 @@ async def oauth_google(request: OAuthGoogleRequest):
         await db.save_user(user)
 
     token_payload = {"sub": user["uid"], "email": user["email"], "role": user.get("role", "student"), "name": user["name"]}
+    tv = await get_token_version(user["uid"])
     return AuthResponse(
         success=True,
-        access_token=create_access_token(token_payload),
-        refresh_token=create_refresh_token(token_payload),
+        access_token=create_access_token(token_payload, token_version=tv),
+        refresh_token=create_refresh_token(token_payload, token_version=tv),
         user_id=user["uid"],
         name=user["name"],
         email=user["email"],
@@ -289,10 +317,11 @@ async def oauth_github(request: OAuthGitHubRequest):
         await db.save_user(user)
 
     token_payload = {"sub": user["uid"], "email": user["email"], "role": user.get("role", "student"), "name": user["name"]}
+    tv = await get_token_version(user["uid"])
     return AuthResponse(
         success=True,
-        access_token=create_access_token(token_payload),
-        refresh_token=create_refresh_token(token_payload),
+        access_token=create_access_token(token_payload, token_version=tv),
+        refresh_token=create_refresh_token(token_payload, token_version=tv),
         user_id=user["uid"],
         name=user["name"],
         email=user["email"],

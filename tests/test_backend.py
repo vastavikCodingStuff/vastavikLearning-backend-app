@@ -268,26 +268,29 @@ def test_payment_and_pro_subscription_unlock():
     headers = get_hmac_headers("/api/v1/payments/create-order", "POST")
     headers["Authorization"] = f"Bearer {token}"
 
-    # Create order
-    order_res = client.post("/api/v1/payments/create-order", json={"plan_id": "monthly_pro", "amount": 149.0}, headers=headers)
+    order_res = client.post("/api/v1/payments/create-order", json={"plan_id": "monthly_pro"}, headers=headers)
     assert order_res.status_code == 200
     order_data = order_res.json()
     order_id = order_data["order_id"]
-    assert order_id.startswith("ORDER_")
+    assert order_id.startswith("order_")
+    assert order_data["amount_paise"] == 17582
 
-    # Process webhook
-    webhook_headers = get_hmac_headers("/api/v1/payments/webhook", "POST")
-    webhook_payload = {
-        "order_id": order_id,
-        "transaction_id": "GATEWAY_TX_999",
-        "status": "success",
-        "signature": "mock_sig_for_test",
-        "uid": "usr_pay_test",
-        "amount": 149.0
+    verify_headers = get_hmac_headers("/api/v1/payments/verify", "POST")
+    verify_headers["Authorization"] = f"Bearer {token}"
+    verify_payload = {
+        "razorpay_order_id": order_id,
+        "razorpay_payment_id": "pay_TEST_999",
+        "razorpay_signature": "dev_sig_anything",
     }
-    wh_res = client.post("/api/v1/payments/webhook", json=webhook_payload, headers=webhook_headers)
-    assert wh_res.status_code == 200
-    assert wh_res.json()["success"] is True
+    v_res = client.post("/api/v1/payments/verify", json=verify_payload, headers=verify_headers)
+    assert v_res.status_code == 200
+    assert v_res.json()["success"] is True
+
+    profile_headers = get_hmac_headers("/api/v1/user/profile", "GET")
+    profile_headers["Authorization"] = f"Bearer {token}"
+    p_res = client.get("/api/v1/user/profile", headers=profile_headers)
+    assert p_res.status_code == 200
+    assert p_res.json()["is_premium"] is True
 
 
 def test_global_search_and_app_update():
