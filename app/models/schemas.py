@@ -436,11 +436,11 @@ class CodingItemResponse(BaseModel):
 
 class PredictOutputItemResponse(BaseModel):
     id: str
-    set_number: int
+    set_number: int = 1
     title: str
-    topic: str
-    question_count: str
-    difficulty: str
+    topic: str = "General"
+    question_count: str = "10 Questions"
+    difficulty: str = "Easy"
     code_snippet: str
     expected_output: Optional[str] = None
     source: str = "sir"  # "sir" | "ai"

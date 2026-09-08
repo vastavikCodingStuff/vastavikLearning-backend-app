@@ -682,6 +682,65 @@ async def delete_pyq(pyq_id: str, admin_user: Dict[str, Any] = Depends(require_a
     return {"success": True, "pyq_id": pyq_id, "deleted": True}
 
 
+# ─── Practice: Predict the Output CRUD ───────────────────────────────────────
+
+class PredictOutputSetCreate(BaseModel):
+    title: str
+    topic: str = "General"
+    difficulty: str = "Easy"  # Easy | Medium | Hard
+    question_count: str = "10 Questions"
+    code_snippet: str
+    expected_output: Optional[str] = None
+    set_number: Optional[int] = None
+    source: str = "sir"
+
+
+@router.get("/practice/predict-output")
+async def list_predict_output_sets(admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    """List all Predict the Output sets from Firestore (and curated baseline if empty)."""
+    from app.routers.practice import DEFAULT_SIR_PREDICT
+    try:
+        sets = [d.to_dict() | {"id": d.id} for d in db.collection("predict_output_sets").stream()]
+        if not sets:
+            sets = [dict(s) for s in DEFAULT_SIR_PREDICT]
+        else:
+            existing_ids = {s.get("id") for s in sets}
+            for ds in DEFAULT_SIR_PREDICT:
+                if ds.get("id") not in existing_ids:
+                    sets.append(dict(ds))
+        return {"sets": sets}
+    except Exception as e:
+        logger.warning(f"Error reading predict_output_sets: {e}")
+        return {"sets": [dict(s) for s in DEFAULT_SIR_PREDICT]}
+
+
+@router.post("/practice/predict-output")
+async def create_predict_output_set(body: PredictOutputSetCreate, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    from app.routers.practice import invalidate_predict_output_cache
+    set_id = f"po_{uuid.uuid4().hex[:10]}"
+    data = body.model_dump() | {
+        "id": set_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not data.get("set_number"):
+        try:
+            existing = list(db.collection("predict_output_sets").stream())
+            data["set_number"] = len(existing) + 1
+        except Exception:
+            data["set_number"] = 1
+    db.collection("predict_output_sets").document(set_id).set(data)
+    invalidate_predict_output_cache()
+    return data
+
+
+@router.delete("/practice/predict-output/{set_id}")
+async def delete_predict_output_set(set_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    from app.routers.practice import invalidate_predict_output_cache
+    db.collection("predict_output_sets").document(set_id).delete()
+    invalidate_predict_output_cache()
+    return {"success": True, "set_id": set_id, "deleted": True}
+
+
 # ─── Practice: AI Ingest (text or PDF → AI → save to right collection) ──────
 #
 # The admin web's "+" button on each practice page offers:
@@ -692,7 +751,7 @@ async def delete_pyq(pyq_id: str, admin_user: Dict[str, Any] = Depends(require_a
 # resulting records to the right Firestore collection.
 
 class IngestRequest(BaseModel):
-    content_type: str  # "quiz" | "coding" | "mcq" | "pyq"
+    content_type: str  # "quiz" | "coding" | "mcq" | "pyq" | "predict_output"
     subject: str
     title: Optional[str] = None
     text: Optional[str] = None
@@ -862,6 +921,20 @@ def _build_ingest_prompt(content_type: str, subject: str, text: str) -> str:
             f'  {{"question": "...", "solution": "...", "marks": <int>}}\n'
             f"]}}\nDo not include any other prose — only the JSON object.\n\n---\n{text}\n---"
         )
+    if content_type == "predict_output":
+        return (
+            f"You are a code tracing and 'predict the output' problem generator/parser. "
+            f"Given the following text or topic about '{subject}', extract or generate "
+            f"predict-the-output problem sets.\n\n"
+            f"Return a JSON object with the key 'sets' (array). Each item must have:\n"
+            f"  title (string, e.g. 'Loop Tracing & Conditionals'),\n"
+            f"  topic (string, e.g. 'Loops & Control Flow'),\n"
+            f"  question_count (string, e.g. '10 Questions'),\n"
+            f"  difficulty (one of: 'Easy', 'Medium', 'Hard'),\n"
+            f"  code_snippet (valid code snippet to trace in Java or Python),\n"
+            f"  expected_output (exact console output string that executing this code produces).\n\n"
+            f"Do not include any other prose — only the JSON object.\n\n---\n{text}\n---"
+        )
     raise HTTPException(status_code=400, detail=f"Unknown content_type: {content_type}")
 
 
@@ -887,8 +960,8 @@ async def ingest_practice_content(
         raise HTTPException(status_code=400, detail="Provide either `text` or `pdf_base64`")
     if body.text and body.pdf_base64:
         raise HTTPException(status_code=400, detail="Provide only one of `text` or `pdf_base64`")
-    if body.content_type not in {"quiz", "coding", "mcq", "pyq"}:
-        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq")
+    if body.content_type not in {"quiz", "coding", "mcq", "pyq", "predict_output"}:
+        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq, predict_output")
 
     # 1. Extract text from PDF if needed.
     source_text = body.text or ""
@@ -1056,6 +1129,36 @@ async def ingest_practice_content(
             "ids": created_ids,
         }
 
+    if body.content_type == "predict_output":
+        from app.routers.practice import invalidate_predict_output_cache
+        sets = (parsed.get("sets") if isinstance(parsed, dict) else None) or []
+        if not isinstance(sets, list) or not sets:
+            sets = (parsed.get("questions") or parsed.get("items") if isinstance(parsed, dict) else None) or []
+        if not isinstance(sets, list) or not sets:
+            raise HTTPException(status_code=400, detail="AI returned no predict output sets")
+        for s in sets:
+            sid = f"po_{uuid.uuid4().hex[:10]}"
+            doc_data = {
+                "id": sid,
+                "title": str(s.get("title", body.title or body.subject)).strip(),
+                "topic": str(s.get("topic", body.subject)).strip(),
+                "question_count": str(s.get("question_count", "10 Questions")).strip(),
+                "difficulty": str(s.get("difficulty", "Medium")).capitalize(),
+                "code_snippet": str(s.get("code_snippet", "")).strip(),
+                "expected_output": str(s.get("expected_output", "")).strip() if s.get("expected_output") else None,
+                "source": "sir",
+                "created_at": now_iso,
+            }
+            db.collection("predict_output_sets").document(sid).set(doc_data)
+            created_ids.append(sid)
+        invalidate_predict_output_cache()
+        return {
+            "success": True,
+            "content_type": "predict_output",
+            "created_count": len(created_ids),
+            "ids": created_ids,
+        }
+
     raise HTTPException(status_code=500, detail="unreachable")
 
 
@@ -1096,8 +1199,8 @@ async def parse_practice_content(
     Same payload as /practice/ingest but no DB writes.
     Returns: {success, content_type, parsed: {...}, preview: true}
     """
-    if body.content_type not in {"quiz", "coding", "mcq", "pyq"}:
-        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq")
+    if body.content_type not in {"quiz", "coding", "mcq", "pyq", "predict_output"}:
+        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq, predict_output")
     source_text = await _extract_source_text(body.text, body.pdf_base64)
     prompt = _build_ingest_prompt(body.content_type, body.subject, source_text)
     try:
@@ -1134,7 +1237,7 @@ async def parse_practice_upload(
 
 
 class SaveEditedRequest(BaseModel):
-    content_type: str  # quiz | coding | mcq | pyq
+    content_type: str  # quiz | coding | mcq | pyq | predict_output
     subject: str
     title: Optional[str] = None
     set_id: Optional[str] = None
@@ -1147,8 +1250,8 @@ async def save_edited_practice_content(
     admin_user: Dict[str, Any] = Depends(require_admin_user),
 ):
     """Persist admin-edited items from preview. Called after user reviews AI output."""
-    if body.content_type not in {"quiz", "coding", "mcq", "pyq"}:
-        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq")
+    if body.content_type not in {"quiz", "coding", "mcq", "pyq", "predict_output"}:
+        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq, predict_output")
     if not body.items:
         raise HTTPException(status_code=400, detail="No items to save")
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1217,6 +1320,24 @@ async def save_edited_practice_content(
             })
             created_ids.append(pyq_id)
         return {"success": True, "content_type": "pyq", "created_count": len(created_ids), "ids": created_ids}
+    if body.content_type == "predict_output":
+        from app.routers.practice import invalidate_predict_output_cache
+        for s in body.items:
+            sid = s.get("id") or f"po_{uuid.uuid4().hex[:10]}"
+            db.collection("predict_output_sets").document(sid).set({
+                "id": sid,
+                "title": str(s.get("title", body.title or body.subject)).strip(),
+                "topic": str(s.get("topic", body.subject)).strip(),
+                "question_count": str(s.get("question_count", "10 Questions")).strip(),
+                "difficulty": str(s.get("difficulty", "Medium")).capitalize(),
+                "code_snippet": str(s.get("code_snippet", "")).strip(),
+                "expected_output": str(s.get("expected_output", "")).strip() if s.get("expected_output") else None,
+                "source": s.get("source", "sir"),
+                "created_at": now_iso,
+            })
+            created_ids.append(sid)
+        invalidate_predict_output_cache()
+        return {"success": True, "content_type": "predict_output", "created_count": len(created_ids), "ids": created_ids}
     raise HTTPException(status_code=500, detail="unreachable")
 
 

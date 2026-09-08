@@ -276,6 +276,13 @@ async def get_coding_exercises(
     return result
 
 
+def invalidate_predict_output_cache():
+    keys = [k for k in list(_cache.keys()) if k.startswith("po_")]
+    for k in keys:
+        _cache.pop(k, None)
+        _cache_timestamps.pop(k, None)
+
+
 @router.get("/predict-output", response_model=List[PredictOutputItemResponse], dependencies=[Depends(rate_limit("general"))])
 async def get_predict_output_sets(
     topic: Optional[str] = Query(None),
@@ -290,6 +297,22 @@ async def get_predict_output_sets(
         return cached
 
     items = list(DEFAULT_SIR_PREDICT)
+
+    try:
+        if db.use_live_firestore:
+            ref = db._firestore_client.collection("predict_output_sets")
+            docs = []
+            for d in ref.stream():
+                doc_dict = d.to_dict() or {}
+                doc_dict["id"] = d.id
+                docs.append(doc_dict)
+            if docs:
+                for idx, doc in enumerate(docs):
+                    if "set_number" not in doc:
+                        doc["set_number"] = idx + 1
+                items = docs + items
+    except Exception:
+        pass
 
     if topic:
         items = [i for i in items if topic.lower() in i.get("topic", "").lower()]
