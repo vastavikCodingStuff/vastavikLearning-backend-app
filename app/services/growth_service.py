@@ -36,10 +36,14 @@ def _query(coll_name: str, field: str, op: str, value: Any) -> List[Dict[str, An
             query = coll.where(filter=FieldFilter(field, op, value))
         except Exception:
             query = coll.where(field, op, value)
-        for d in query.stream():
-            data = d.to_dict() or {}
-            data["id"] = d.id
-            items.append(data)
+        try:
+            for d in query.stream():
+                data = d.to_dict() or {}
+                data["id"] = d.id
+                items.append(data)
+        except Exception:
+            # Fallback to memory on stream error
+            pass
         return items
 
     coll = db.collection(coll_name)
@@ -47,6 +51,8 @@ def _query(coll_name: str, field: str, op: str, value: Any) -> List[Dict[str, An
         val = (d.to_dict() or {}).get(field)
         match = False
         if op == "==" and val == value:
+            match = True
+        elif op == "!=" and val != value:
             match = True
         elif op == "in" and isinstance(value, list) and val in value:
             match = True
@@ -57,17 +63,50 @@ def _query(coll_name: str, field: str, op: str, value: Any) -> List[Dict[str, An
     return items
 
 
+def _query_all(coll_name: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    try:
+        coll = db.collection(coll_name)
+        for d in coll.stream():
+            data = d.to_dict() or {}
+            data["id"] = d.id
+            items.append(data)
+    except Exception:
+        pass
+    return items
+
+
 def _save(coll_name: str, doc_id: str, data: Dict[str, Any]) -> None:
-    coll = db.collection(coll_name)
-    coll.document(doc_id).set(data, merge=True)
+    try:
+        coll = db.collection(coll_name)
+        coll.document(doc_id).set(data, merge=True)
+    except Exception:
+        # Ensure memory fallback
+        coll = db.collection(coll_name)
+        try:
+            coll.document(doc_id).set(data, merge=True)
+        except Exception:
+            pass
 
 
-def _get_user(uid: str) -> Dict[str, Any]:
+async def _get_user(uid: str) -> Dict[str, Any]:
+    # Memory cache first
     user = db._memory_users.get(uid)
-    if user is None:
-        user = {"uid": uid, "name": "Student", "email": f"{uid}@placeholder.local", "role": "student",
-                "is_premium": False, "credit_balance": 0.0, "access_type": "free"}
-        db._memory_users[uid] = user
+    if user is not None:
+        return user
+    # Live Firestore lookup
+    if db.use_live_firestore:
+        try:
+            live = await db.get_user_by_id(uid)
+            if live:
+                db._memory_users[uid] = live
+                return live
+        except Exception:
+            pass
+    # Fallback placeholder
+    user = {"uid": uid, "name": "Student", "email": f"{uid}@placeholder.local", "role": "student",
+            "is_premium": False, "credit_balance": 0.0, "access_type": "free"}
+    db._memory_users[uid] = user
     return user
 
 
@@ -93,57 +132,86 @@ def _generate_unique_code(retries: int = 10) -> str:
 
 
 async def ensure_referral_code(uid: str) -> Dict[str, Any]:
-    user = _get_user(uid)
-    if not _is_eligible_for_referral(user):
-        return {
-            "eligible": False,
-            "reason": "Refer & Earn unlocks only after a successful first payment (or an offline coupon activation).",
-            "code": None,
-        }
+    try:
+        user = await _get_user(uid)
+        if not _is_eligible_for_referral(user):
+            return {
+                "eligible": False,
+                "reason": "Refer & Earn unlocks only after a successful first payment (or an offline coupon activation).",
+                "code": None,
+            }
 
-    existing = _query("referrals", "uid", "==", uid)
-    if existing:
-        ref = existing[0]
-        return {"eligible": True, "code": ref["code"], "created_at": ref.get("created_at")}
+        existing = _query("referrals", "uid", "==", uid)
+        if existing:
+            ref = existing[0]
+            return {"eligible": True, "code": ref["code"], "created_at": ref.get("created_at")}
 
-    code = _generate_unique_code()
-    _save("referrals", code, {
-        "code": code,
-        "uid": uid,
-        "created_at": _now(),
-        "active": True,
-    })
-    await db.update_user(uid, {"referral_code": code})
-    return {"eligible": True, "code": code, "created_at": _now()}
+        code = _generate_unique_code()
+        _save("referrals", code, {
+            "code": code,
+            "uid": uid,
+            "created_at": _now(),
+            "active": True,
+        })
+        await db.update_user(uid, {"referral_code": code})
+        # Update memory cache
+        try:
+            u = await _get_user(uid)
+            u["referral_code"] = code
+        except Exception:
+            pass
+        return {"eligible": True, "code": code, "created_at": _now()}
+    except Exception as e:
+        return {"eligible": False, "reason": f"Unable to generate code: {str(e)}", "code": None}
 
 
 async def get_referral_status(uid: str) -> Dict[str, Any]:
-    user = _get_user(uid)
-    code = user.get("referral_code")
-    redemptions = _query("referral_redemptions", "referrer_uid", "==", uid)
-    rewarded = [r for r in redemptions if r.get("status") == "rewarded"]
-    pending = [r for r in redemptions if r.get("status") == "pending"]
-    return {
-        "code": code,
-        "eligible": _is_eligible_for_referral(user),
-        "rewards_total": REFERRAL_REWARD_INR,
-        "cap": REFERRAL_REWARD_CAP,
-        "rewarded_count": len(rewarded),
-        "pending_count": len(pending),
-        "remaining_count": max(0, REFERRAL_REWARD_CAP - len(rewarded)),
-        "credit_balance_inr": _round2(user.get("credit_balance", 0.0)),
-        "history": [
-            {
-                "referee_uid": r.get("referee_uid"),
-                "referee_email": r.get("referee_email"),
-                "status": r.get("status"),
-                "reward_amount": r.get("reward_amount", REFERRAL_REWARD_INR),
-                "created_at": r.get("created_at"),
-                "rewarded_at": r.get("rewarded_at"),
-            }
-            for r in sorted(redemptions + pending, key=lambda x: x.get("created_at") or "")
-        ],
-    }
+    try:
+        user = await _get_user(uid)
+        code = user.get("referral_code")
+        # Fallback: lookup referrals collection if memory code missing
+        if not code:
+            existing = _query("referrals", "uid", "==", uid)
+            if existing:
+                code = existing[0].get("code")
+        redemptions = _query("referral_redemptions", "referrer_uid", "==", uid)
+        rewarded = [r for r in redemptions if r.get("status") == "rewarded"]
+        pending = [r for r in redemptions if r.get("status") == "pending"]
+        return {
+            "code": code,
+            "eligible": _is_eligible_for_referral(user),
+            "rewards_total": REFERRAL_REWARD_INR,
+            "cap": REFERRAL_REWARD_CAP,
+            "rewarded_count": len(rewarded),
+            "pending_count": len(pending),
+            "remaining_count": max(0, REFERRAL_REWARD_CAP - len(rewarded)),
+            "credit_balance_inr": _round2(user.get("credit_balance", 0.0)),
+            "history": [
+                {
+                    "referee_uid": r.get("referee_uid"),
+                    "referee_email": r.get("referee_email"),
+                    "status": r.get("status"),
+                    "reward_amount": r.get("reward_amount", REFERRAL_REWARD_INR),
+                    "created_at": r.get("created_at"),
+                    "rewarded_at": r.get("rewarded_at"),
+                }
+                for r in sorted(redemptions, key=lambda x: x.get("created_at") or "")
+            ],
+        }
+    except Exception as e:
+        # Never throw 500 to client; return safe empty status
+        return {
+            "code": None,
+            "eligible": False,
+            "rewards_total": REFERRAL_REWARD_INR,
+            "cap": REFERRAL_REWARD_CAP,
+            "rewarded_count": 0,
+            "pending_count": 0,
+            "remaining_count": REFERRAL_REWARD_CAP,
+            "credit_balance_inr": 0.0,
+            "history": [],
+            "error": str(e),
+        }
 
 
 async def attribute_referral_on_signup(referee_uid: str, code: str, device_id: str) -> Optional[Dict[str, Any]]:
@@ -157,7 +225,7 @@ async def attribute_referral_on_signup(referee_uid: str, code: str, device_id: s
     if not referrer_uid or referrer_uid == referee_uid:
         return None
 
-    referrer = _get_user(referrer_uid)
+    referrer = await _get_user(referrer_uid)
     active_device_id = (referrer.get("active_device") or {}).get("device_id")
     flagged = bool(device_id and active_device_id and active_device_id == device_id)
 
@@ -168,11 +236,12 @@ async def attribute_referral_on_signup(referee_uid: str, code: str, device_id: s
         )
         return None
 
+    referee_user = await _get_user(referee_uid)
     _save("referral_redemptions", f"{referrer_uid}_{referee_uid}", {
         "code": code,
         "referrer_uid": referrer_uid,
         "referee_uid": referee_uid,
-        "referee_email": _get_user(referee_uid).get("email"),
+        "referee_email": referee_user.get("email"),
         "status": "pending",
         "reward_amount": REFERRAL_REWARD_INR,
         "created_at": _now(),
@@ -185,33 +254,43 @@ async def attribute_referral_on_signup(referee_uid: str, code: str, device_id: s
 
 
 async def get_share_link(uid: str) -> Dict[str, Any]:
-    user = _get_user(uid)
-    eligible = _is_eligible_for_referral(user)
-    shares = _query("shares", "uid", "==", uid)
-    rewarded = [s for s in shares if s.get("status") == "rewarded"]
-    return {
-        "eligible": eligible,
-        "cap": SHARE_REWARD_CAP,
-        "rewarded_count": len(rewarded),
-        "remaining_count": max(0, SHARE_REWARD_CAP - len(rewarded)),
-        "share_url_template": f"{SHARE_LINK_HOST}/s/{{token}}",
-        "shares": [
-            {
-                "token": s.get("token"),
-                "share_url": f"{SHARE_LINK_HOST}/s/{s.get('token')}",
-                "status": s.get("status"),
-                "clicks": len(s.get("clicks") or []),
-                "created_at": s.get("created_at"),
-                "converted_at": s.get("converted_at"),
-                "converted_uid": s.get("converted_uid"),
-            }
-            for s in sorted(shares, key=lambda x: x.get("created_at") or "", reverse=True)
-        ],
-    }
+    try:
+        user = await _get_user(uid)
+        eligible = _is_eligible_for_referral(user)
+        shares = _query("shares", "uid", "==", uid)
+        rewarded = [s for s in shares if s.get("status") == "rewarded"]
+        return {
+            "eligible": eligible,
+            "cap": SHARE_REWARD_CAP,
+            "rewarded_count": len(rewarded),
+            "remaining_count": max(0, SHARE_REWARD_CAP - len(rewarded)),
+            "share_url_template": f"{SHARE_LINK_HOST}/s/{{token}}",
+            "shares": [
+                {
+                    "token": s.get("token"),
+                    "share_url": f"{SHARE_LINK_HOST}/s/{s.get('token')}",
+                    "status": s.get("status"),
+                    "clicks": len(s.get("clicks") or []),
+                    "created_at": s.get("created_at"),
+                    "converted_at": s.get("converted_at"),
+                    "converted_uid": s.get("converted_uid"),
+                }
+                for s in sorted(shares, key=lambda x: x.get("created_at") or "", reverse=True)
+            ],
+        }
+    except Exception:
+        return {
+            "eligible": False,
+            "cap": SHARE_REWARD_CAP,
+            "rewarded_count": 0,
+            "remaining_count": SHARE_REWARD_CAP,
+            "share_url_template": f"{SHARE_LINK_HOST}/s/{{token}}",
+            "shares": [],
+        }
 
 
 async def create_share_token(uid: str) -> Dict[str, Any]:
-    user = _get_user(uid)
+    user = await _get_user(uid)
     if not _is_eligible_for_referral(user):
         return {"eligible": False, "reason": "Share-to-earn unlocks only after a successful first payment."}
     shares = _query("shares", "uid", "==", uid)
@@ -275,15 +354,25 @@ async def attribute_share_on_signup(referee_uid: str, token: str) -> Optional[Di
 
 async def get_active_coupon() -> Dict[str, Any]:
     if db.use_live_firestore:
-        snap = db.collection("coupon_codes").document(COUPON_DOC_ID).get()
-        if not snap.exists:
-            return {"code": "", "updated_at": None, "updated_by": None}
-        c = snap.to_dict() or {}
-    else:
-        c = (db.collection("coupon_codes").document(COUPON_DOC_ID).get().to_dict()) if COUPON_DOC_ID in db._memory_collections.get("coupon_codes", {}) else {}
-    if not c:
+        try:
+            snap = db.collection("coupon_codes").document(COUPON_DOC_ID).get()
+            if not snap.exists:
+                return {"code": "", "updated_at": None, "updated_by": None}
+            c = snap.to_dict() or {}
+            if not c:
+                return {"code": "", "updated_at": None, "updated_by": None}
+            return {"code": c.get("code", ""), "updated_at": c.get("updated_at"), "updated_by": c.get("updated_by")}
+        except Exception:
+            pass
         return {"code": "", "updated_at": None, "updated_by": None}
-    return {"code": c.get("code", ""), "updated_at": c.get("updated_at"), "updated_by": c.get("updated_by")}
+    else:
+        try:
+            c = (db.collection("coupon_codes").document(COUPON_DOC_ID).get().to_dict()) if COUPON_DOC_ID in db._memory_collections.get("coupon_codes", {}) else {}
+        except Exception:
+            c = {}
+        if not c:
+            return {"code": "", "updated_at": None, "updated_by": None}
+        return {"code": c.get("code", ""), "updated_at": c.get("updated_at"), "updated_by": c.get("updated_by")}
 
 
 async def set_active_coupon(code: str, admin_uid: str) -> Dict[str, Any]:
@@ -301,7 +390,7 @@ async def redeem_coupon(uid: str, code: str) -> Dict[str, Any]:
     active = await get_active_coupon()
     if not active.get("code") or code.lower() != active["code"].lower():
         return {"success": False, "reason": "Invalid coupon code."}
-    user = _get_user(uid)
+    user = await _get_user(uid)
     if user.get("access_type") == "offline-comp":
         return {"success": True, "already_active": True, "message": "Coupon already applied to this account."}
     await db.update_user(uid, {
@@ -315,6 +404,13 @@ async def redeem_coupon(uid: str, code: str) -> Dict[str, Any]:
         "redeemed_at": _now(),
         "marked_by": "self",
     })
+    # Update memory cache
+    try:
+        u = await _get_user(uid)
+        u["access_type"] = "offline-comp"
+        u["is_premium"] = True
+    except Exception:
+        pass
     return {"success": True, "already_active": False, "message": "Free offline access activated."}
 
 
@@ -328,36 +424,43 @@ def _credit_ledger(uid: str, source: str, amount: float, ref: str = "") -> None:
     })
 
 
-def credit_balance_of(uid: str) -> float:
-    return _round2(_get_user(uid).get("credit_balance", 0.0))
+async def credit_balance_of(uid: str) -> float:
+    user = await _get_user(uid)
+    return _round2(user.get("credit_balance", 0.0))
 
 
 async def grant_credit(uid: str, amount: float, source: str, ref: str = "") -> float:
-    user = _get_user(uid)
+    user = await _get_user(uid)
     new_balance = _round2(user.get("credit_balance", 0.0) + amount)
     await db.update_user(uid, {"credit_balance": new_balance})
+    try:
+        u = await _get_user(uid)
+        u["credit_balance"] = new_balance
+    except Exception:
+        pass
     _credit_ledger(uid, source, amount, ref)
     return new_balance
 
 
 async def consume_credit(uid: str, amount: float, ref: str = "") -> float:
-    user = _get_user(uid)
+    user = await _get_user(uid)
     current = _round2(user.get("credit_balance", 0.0))
     consumed = _round2(min(current, max(0.0, amount)))
     new_balance = _round2(current - consumed)
     await db.update_user(uid, {"credit_balance": new_balance})
+    try:
+        u = await _get_user(uid)
+        u["credit_balance"] = new_balance
+    except Exception:
+        pass
     if consumed > 0:
         _credit_ledger(uid, "consumption", -consumed, ref)
     return consumed
 
 
 async def award_referral_and_share_rewards(referee_uid: str, order_id: str) -> Dict[str, Any]:
-    """
-    Called when a referee's payment is verified. Applies referral reward (capped)
-    and share reward (capped). Idempotent via per-redemption status flags.
-    """
     result: Dict[str, Any] = {"referral_awarded": False, "share_awarded": False}
-    user = _get_user(referee_uid)
+    user = await _get_user(referee_uid)
 
     referrer_uid = user.get("referred_by")
     if referrer_uid:
@@ -410,7 +513,7 @@ async def credits_ledger(uid: str, limit: int = 50) -> List[Dict[str, Any]]:
 
 
 async def apply_payment_success(uid: str, order_id: str, credit_applied: float) -> Dict[str, Any]:
-    user = _get_user(uid)
+    user = await _get_user(uid)
     now = datetime.now(timezone.utc)
     current_expiry = user.get("subscription_expires_at")
     base_expiry = now
@@ -436,24 +539,29 @@ async def apply_payment_success(uid: str, order_id: str, credit_applied: float) 
         await consume_credit(uid, credit_applied, ref=order_id)
 
     await db.update_user(uid, updates)
+    try:
+        u = await _get_user(uid)
+        u.update(updates)
+    except Exception:
+        pass
     rewards = await award_referral_and_share_rewards(uid, order_id)
     return {
         "subscription_expires_at": new_expiry,
         "is_premium": True,
         "credit_consumed": credit_applied,
-        "credit_balance_inr": credit_balance_of(uid),
+        "credit_balance_inr": await credit_balance_of(uid),
         "rewards": rewards,
     }
 
 
-def user_quote(uid: str) -> Dict[str, Any]:
-    user = _get_user(uid)
+async def user_quote(uid: str) -> Dict[str, Any]:
+    user = await _get_user(uid)
     balance = _round2(user.get("credit_balance", 0.0))
     return {**compute_quote(balance), "credit_balance_inr": balance}
 
 
 async def grant_referrer_credit_for_payment(uid: str, payment_id: str) -> Dict[str, Any]:
-    user = _get_user(uid)
+    user = await _get_user(uid)
     referrer_uid = user.get("referred_by")
     if not referrer_uid:
         return {"awarded": False, "reason": "no_referrer"}
@@ -476,7 +584,7 @@ async def grant_referrer_credit_for_payment(uid: str, payment_id: str) -> Dict[s
 
 
 async def convert_share_if_eligible(uid: str) -> Dict[str, Any]:
-    user = _get_user(uid)
+    user = await _get_user(uid)
     attr = user.get("share_attribution") or {}
     token = attr.get("token")
     if not token:
@@ -502,27 +610,44 @@ async def convert_share_if_eligible(uid: str) -> Dict[str, Any]:
 
 
 async def admin_growth_overview() -> Dict[str, Any]:
-    referrals = _query("referrals", "active", "==", True)
-    shares = _query("shares", "status", "in", ["rewarded", "converted", "active"])
-    redemptions = _query("referral_redemptions", "status", "==", "rewarded")
-    return {
-        "total_referral_codes": len(referrals),
-        "total_shares": len(shares),
-        "total_referral_rewards_paid": len(redemptions) * REFERRAL_REWARD_INR,
-        "total_share_rewards_paid": len([s for s in shares if s.get("status") == "rewarded"]) * SHARE_REWARD_INR,
-        "referral_reward_cap": REFERRAL_REWARD_CAP,
-        "share_reward_cap": SHARE_REWARD_CAP,
-        "referral_reward_inr": REFERRAL_REWARD_INR,
-        "share_reward_inr": SHARE_REWARD_INR,
-    }
+    try:
+        referrals = _query("referrals", "active", "==", True)
+        shares = _query("shares", "status", "in", ["rewarded", "converted", "active"])
+        redemptions = _query("referral_redemptions", "status", "==", "rewarded")
+        return {
+            "total_referral_codes": len(referrals),
+            "total_shares": len(shares),
+            "total_referral_rewards_paid": len(redemptions) * REFERRAL_REWARD_INR,
+            "total_share_rewards_paid": len([s for s in shares if s.get("status") == "rewarded"]) * SHARE_REWARD_INR,
+            "referral_reward_cap": REFERRAL_REWARD_CAP,
+            "share_reward_cap": SHARE_REWARD_CAP,
+            "referral_reward_inr": REFERRAL_REWARD_INR,
+            "share_reward_inr": SHARE_REWARD_INR,
+        }
+    except Exception:
+        return {
+            "total_referral_codes": 0,
+            "total_shares": 0,
+            "total_referral_rewards_paid": 0,
+            "total_share_rewards_paid": 0,
+            "referral_reward_cap": REFERRAL_REWARD_CAP,
+            "share_reward_cap": SHARE_REWARD_CAP,
+            "referral_reward_inr": REFERRAL_REWARD_INR,
+            "share_reward_inr": SHARE_REWARD_INR,
+        }
 
 
 async def admin_list_referrals() -> List[Dict[str, Any]]:
-    items = _query("referrals", "active", "==", True)
+    items = _query_all("referrals")
     out = []
     for r in items:
+        if not r.get("active"):
+            continue
         uid = r.get("uid")
-        user = _get_user(uid) if uid else {}
+        try:
+            user = await _get_user(uid) if uid else {}
+        except Exception:
+            user = {}
         redemptions = _query("referral_redemptions", "referrer_uid", "==", uid)
         rewarded = [x for x in redemptions if x.get("status") == "rewarded"]
         out.append({
@@ -538,11 +663,14 @@ async def admin_list_referrals() -> List[Dict[str, Any]]:
 
 
 async def admin_list_shares() -> List[Dict[str, Any]]:
-    items = _query("shares", "uid", "!=", None)
+    items = _query_all("shares")
     out = []
     for s in items:
         uid = s.get("uid")
-        user = _get_user(uid) if uid else {}
+        try:
+            user = await _get_user(uid) if uid else {}
+        except Exception:
+            user = {}
         out.append({
             "token": s.get("token"),
             "uid": uid,
@@ -557,15 +685,18 @@ async def admin_list_shares() -> List[Dict[str, Any]]:
 
 
 async def admin_list_devices() -> List[Dict[str, Any]]:
-    items = _query("device_bindings", "uid", "!=", None)
+    items = _query_all("device_bindings")
     out = []
     seen = set()
     for it in items:
         uid = it.get("uid")
-        if uid in seen:
+        if not uid or uid in seen:
             continue
         seen.add(uid)
-        user = _get_user(uid)
+        try:
+            user = await _get_user(uid)
+        except Exception:
+            user = {}
         active = user.get("active_device") or {}
         out.append({
             "uid": uid,
@@ -581,6 +712,6 @@ async def admin_list_devices() -> List[Dict[str, Any]]:
 
 
 async def admin_list_device_events() -> List[Dict[str, Any]]:
-    items = _query("device_events", "uid", "!=", None)
+    items = _query_all("device_events")
     items.sort(key=lambda x: x.get("ts") or "", reverse=True)
     return items[:200]
