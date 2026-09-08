@@ -4,11 +4,12 @@ Provides: student management, AI chat sessions, code usage logs,
 completion stats, and practice content (quiz/coding/MCQ) CRUD.
 All routes require admin JWT claim.
 """
+import json
 import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, status, Depends, Query
+from fastapi import APIRouter, HTTPException, status, Depends, Query, UploadFile, File, Form
 from pydantic import BaseModel
 
 from app.core.security import require_admin_user, get_current_user_optional
@@ -497,6 +498,413 @@ async def create_mcq(body: MCQCreate, admin_user: Dict[str, Any] = Depends(requi
 async def delete_mcq(mcq_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
     db.collection("mcqs").document(mcq_id).delete()
     return {"success": True, "message": f"MCQ {mcq_id} deleted"}
+
+
+# ─── Practice: PYQ admin CRUD ────────────────────────────────────────────────
+
+class PYQCreate(BaseModel):
+    board: str
+    year: str
+    subject: str
+    question: str
+    solution: str
+    marks: int = 0
+
+
+@router.get("/practice/pyq")
+async def list_pyqs(
+    board: Optional[str] = Query(None),
+    year: Optional[str] = Query(None),
+    subject: Optional[str] = Query(None),
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """List admin-curated PYQs with optional filters (board, year, subject)."""
+    try:
+        ref = db.collection("pyqs")
+        if board:
+            ref = ref.where("board", "==", board)
+        if year:
+            ref = ref.where("year", "==", year)
+        if subject:
+            ref = ref.where("subject", "==", subject)
+        rows = [d.to_dict() | {"id": d.id} for d in ref.stream()]
+        return {"pyqs": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/practice/pyq")
+async def create_pyq(body: PYQCreate, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    pyq_id = f"pyq_{uuid.uuid4().hex[:10]}"
+    data = body.model_dump() | {
+        "id": pyq_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    db.collection("pyqs").document(pyq_id).set(data)
+    return data
+
+
+@router.delete("/practice/pyq/{pyq_id}")
+async def delete_pyq(pyq_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    db.collection("pyqs").document(pyq_id).delete()
+    return {"success": True, "pyq_id": pyq_id, "deleted": True}
+
+
+# ─── Practice: AI Ingest (text or PDF → AI → save to right collection) ──────
+#
+# The admin web's "+" button on each practice page offers:
+#   - "Write" — a structured text editor
+#   - "PDF"   — file upload
+# Both paths hit this endpoint. We ask Mistral/Gemini to parse the
+# content into the schema of the requested content_type and save the
+# resulting records to the right Firestore collection.
+
+class IngestRequest(BaseModel):
+    content_type: str  # "quiz" | "coding" | "mcq" | "pyq"
+    subject: str
+    title: Optional[str] = None
+    text: Optional[str] = None
+    pdf_base64: Optional[str] = None
+    set_id: Optional[str] = None  # for quiz questions, optional — auto-create if missing
+    model: Optional[str] = "mistral"
+
+
+def _parse_json_block(raw: str) -> Any:
+    """Robust JSON extraction from an LLM response (handles ```json fences, prose, etc.)."""
+    if not raw:
+        raise ValueError("empty model response")
+    s = raw.strip()
+    # Strip ```json ... ``` fences
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:]
+        s = s.strip()
+    # Find the first { or [ and the matching close
+    first_obj = s.find("{")
+    first_arr = s.find("[")
+    candidates = [i for i in (first_obj, first_arr) if i >= 0]
+    if not candidates:
+        raise ValueError("no JSON object/array found in model response")
+    start = min(candidates)
+    s = s[start:]
+    return json.loads(s)
+
+
+async def _call_ai_parser(prompt: str, model: str) -> str:
+    """Call Mistral (preferred) or Gemini, return raw text. Raises on failure."""
+    from app.core.config import settings
+    import httpx
+
+    if model == "gemini" and settings.GEMINI_API_KEY:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}"
+        )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                url,
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000},
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    if settings.MISTRAL_API_KEY:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {settings.MISTRAL_API_KEY}"},
+                json={
+                    "model": "mistral-small-latest",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 4000,
+                },
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "No AI model configured. Set MISTRAL_API_KEY or GEMINI_API_KEY in backend env to enable ingest."
+        ),
+    )
+
+
+def _build_ingest_prompt(content_type: str, subject: str, text: str) -> str:
+    """Tell the model exactly which JSON shape to return for each content_type."""
+    if content_type == "quiz":
+        return (
+            f"You are an exam question parser. Given the following text (which may be a single "
+            f"question or a set of questions for a quiz titled '{subject}'), extract all multiple-choice "
+            f"questions.\n\nReturn a JSON object with this exact shape:\n"
+            f'{{"title": "<quiz title>", "questions": [\n'
+            f'  {{"question": "...", "options": ["A", "B", "C", "D"], "correct_index": 0, '
+            f'"explanation": "...", "difficulty": "easy|medium|hard"}}\n'
+            f"]}}\n\nDo not include any other prose — only the JSON object.\n\n---\n{text}\n---"
+        )
+    if content_type == "mcq":
+        return (
+            f"You are an exam question parser. Given the following text about '{subject}', extract "
+            f"each standalone multiple-choice question.\n\n"
+            f'Return a JSON object: {{"questions": [{{"question": "...", "options": ["A", "B", "C", "D"], '
+            f'"correct_index": 0, "explanation": "...", "topic": "<sub-topic>", '
+            f'"difficulty": "easy|medium|hard"}}]}}.\n'
+            f"Do not include any other prose — only the JSON object.\n\n---\n{text}\n---"
+        )
+    if content_type == "coding":
+        return (
+            f"You are a coding exercise parser. Given the following text about '{subject}', extract "
+            f"each coding exercise.\n\nReturn a JSON object with the key 'exercises' (array). Each item:\n"
+            f'  title (string), description (string), language (one of java|python|cpp|javascript|sql), '
+            f'starter_code (string), solution_code (string), '
+            f'test_cases (array of objects with input and expected_output), '
+            f"difficulty (one of easy|medium|hard).\n"
+            f"Do not include any other prose — only the JSON object.\n\n---\n{text}\n---"
+        )
+    if content_type == "pyq":
+        return (
+            f"You are a past-year question paper parser. Given the following text about '{subject}', "
+            f"extract each question and its model answer.\n\n"
+            f'Return a JSON object: {{"questions": [\n'
+            f'  {{"question": "...", "solution": "...", "marks": <int>}}\n'
+            f"]}}\nDo not include any other prose — only the JSON object.\n\n---\n{text}\n---"
+        )
+    raise HTTPException(status_code=400, detail=f"Unknown content_type: {content_type}")
+
+
+@router.post("/practice/ingest")
+async def ingest_practice_content(
+    body: IngestRequest,
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """
+    Ingest practice content from text or PDF, parse via AI, and save to the
+    right Firestore collection. Returns the list of created records.
+
+    Body:
+      - content_type: "quiz" | "coding" | "mcq" | "pyq"
+      - subject: free-text label (board/topic/course)
+      - title: optional quiz title (used only for content_type=quiz)
+      - text: the raw source text (mutually exclusive with pdf_base64)
+      - pdf_base64: the PDF file encoded as base64 (mutually exclusive with text)
+      - set_id: optional existing quiz set id; auto-created if absent
+      - model: "mistral" (default) or "gemini"
+    """
+    if not body.text and not body.pdf_base64:
+        raise HTTPException(status_code=400, detail="Provide either `text` or `pdf_base64`")
+    if body.text and body.pdf_base64:
+        raise HTTPException(status_code=400, detail="Provide only one of `text` or `pdf_base64`")
+    if body.content_type not in {"quiz", "coding", "mcq", "pyq"}:
+        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq")
+
+    # 1. Extract text from PDF if needed.
+    source_text = body.text or ""
+    if body.pdf_base64:
+        try:
+            import base64
+            import io
+            try:
+                from pypdf import PdfReader  # type: ignore
+            except Exception:
+                from PyPDF2 import PdfReader  # type: ignore
+            pdf_bytes = base64.b64decode(body.pdf_base64)
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            source_text = "\n\n".join((p.extract_text() or "") for p in reader.pages).strip()
+            if not source_text:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not extract any text from the PDF (image-only or empty).",
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse PDF: {e}")
+
+    # 2. Ask the AI to extract structured records.
+    prompt = _build_ingest_prompt(body.content_type, body.subject, source_text)
+    try:
+        raw = await _call_ai_parser(prompt, body.model or "mistral")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI parser call failed: {e}")
+
+    # 3. Parse the JSON out of the model response.
+    try:
+        parsed = _parse_json_block(raw)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI returned unparseable JSON: {e}. Raw (first 200 chars): {raw[:200]}",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    created_ids: List[str] = []
+
+    # 4. Persist into the right collection.
+    if body.content_type == "quiz":
+        set_id = body.set_id or str(uuid.uuid4())
+        title = body.title or (parsed.get("title") if isinstance(parsed, dict) else None) or body.subject
+        # Ensure the quiz set exists.
+        set_ref = db.collection("practice_quizzes").document(set_id)
+        if not set_ref.get().exists:
+            set_ref.set({
+                "id": set_id,
+                "title": title,
+                "subject": body.subject,
+                "question_count": 0,
+                "created_at": now_iso,
+            })
+        else:
+            # Refresh title if the admin provided one
+            if body.title:
+                set_ref.update({"title": body.title, "subject": body.subject})
+
+        questions = (parsed.get("questions") if isinstance(parsed, dict) else None) or []
+        if not isinstance(questions, list) or not questions:
+            raise HTTPException(status_code=400, detail="AI returned no questions")
+
+        for q in questions:
+            qid = str(uuid.uuid4())
+            qdata = {
+                "id": qid,
+                "set_id": set_id,
+                "question": str(q.get("question", "")).strip(),
+                "options": [str(x) for x in (q.get("options") or [])][:6],
+                "correct_index": int(q.get("correct_index", 0) or 0),
+                "explanation": str(q.get("explanation", "")).strip(),
+                "subject": body.subject,
+                "difficulty": str(q.get("difficulty", "easy")).lower(),
+                "created_at": now_iso,
+            }
+            db.collection("quiz_questions").document(qid).set(qdata)
+            created_ids.append(qid)
+        # Update question count
+        set_ref.update({"question_count": len(created_ids)})
+        return {
+            "success": True,
+            "content_type": "quiz",
+            "set_id": set_id,
+            "created_count": len(created_ids),
+            "ids": created_ids,
+        }
+
+    if body.content_type == "mcq":
+        questions = (parsed.get("questions") if isinstance(parsed, dict) else None) or []
+        if not isinstance(questions, list) or not questions:
+            raise HTTPException(status_code=400, detail="AI returned no questions")
+        for q in questions:
+            mid = str(uuid.uuid4())
+            db.collection("mcqs").document(mid).set({
+                "id": mid,
+                "question": str(q.get("question", "")).strip(),
+                "options": [str(x) for x in (q.get("options") or [])][:6],
+                "correct_index": int(q.get("correct_index", 0) or 0),
+                "explanation": str(q.get("explanation", "")).strip(),
+                "subject": body.subject,
+                "topic": str(q.get("topic", body.subject)).strip(),
+                "difficulty": str(q.get("difficulty", "easy")).lower(),
+                "created_at": now_iso,
+            })
+            created_ids.append(mid)
+        return {
+            "success": True,
+            "content_type": "mcq",
+            "created_count": len(created_ids),
+            "ids": created_ids,
+        }
+
+    if body.content_type == "coding":
+        exercises = (parsed.get("exercises") if isinstance(parsed, dict) else None) or []
+        if not isinstance(exercises, list) or not exercises:
+            raise HTTPException(status_code=400, detail="AI returned no exercises")
+        for ex in exercises:
+            eid = str(uuid.uuid4())
+            db.collection("coding_exercises").document(eid).set({
+                "id": eid,
+                "title": str(ex.get("title", "Untitled")).strip(),
+                "description": str(ex.get("description", "")).strip(),
+                "language": str(ex.get("language", "java")).lower(),
+                "starter_code": str(ex.get("starter_code", "")).strip(),
+                "solution_code": str(ex.get("solution_code", "")).strip(),
+                "test_cases": ex.get("test_cases") or [],
+                "difficulty": str(ex.get("difficulty", "easy")).lower(),
+                "created_at": now_iso,
+            })
+            created_ids.append(eid)
+        return {
+            "success": True,
+            "content_type": "coding",
+            "created_count": len(created_ids),
+            "ids": created_ids,
+        }
+
+    if body.content_type == "pyq":
+        questions = (parsed.get("questions") if isinstance(parsed, dict) else None) or []
+        if not isinstance(questions, list) or not questions:
+            raise HTTPException(status_code=400, detail="AI returned no questions")
+        for q in questions:
+            pyq_id = f"pyq_{uuid.uuid4().hex[:10]}"
+            db.collection("pyqs").document(pyq_id).set({
+                "id": pyq_id,
+                "board": body.subject.split("|")[0].strip() if "|" in body.subject else "ICSE",
+                "year": body.subject.split("|")[1].strip() if "|" in body.subject else "2024",
+                "subject": body.subject.split("|")[2].strip() if "|" in body.subject else body.subject,
+                "question": str(q.get("question", "")).strip(),
+                "solution": str(q.get("solution", "")).strip(),
+                "marks": int(q.get("marks", 0) or 0),
+                "created_at": now_iso,
+            })
+            created_ids.append(pyq_id)
+        return {
+            "success": True,
+            "content_type": "pyq",
+            "created_count": len(created_ids),
+            "ids": created_ids,
+        }
+
+    raise HTTPException(status_code=500, detail="unreachable")
+
+
+# ─── Practice: AI Ingest (multipart, PDF file upload) ────────────────────────
+#
+# Convenience endpoint so the admin web can upload a PDF directly with
+# `FormData` instead of having to base64-encode it client-side. Internally
+# it re-uses the same JSON ingest flow by base64-encoding the file.
+
+@router.post("/practice/ingest/upload")
+async def ingest_practice_upload(
+    content_type: str = Form(...),
+    subject: str = Form(...),
+    title: Optional[str] = Form(None),
+    set_id: Optional[str] = Form(None),
+    model: Optional[str] = Form("mistral"),
+    file: UploadFile = File(...),
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Same as /practice/ingest but accepts a multipart PDF upload."""
+    if (file.content_type or "").lower() not in {"application/pdf", "application/octet-stream"}:
+        raise HTTPException(status_code=400, detail="Only PDF uploads are supported here")
+    body_bytes = await file.read()
+    import base64
+    pdf_b64 = base64.b64encode(body_bytes).decode("ascii")
+    # Re-use the JSON ingest path
+    from fastapi import Request
+    fake_req = IngestRequest(
+        content_type=content_type,
+        subject=subject,
+        title=title,
+        pdf_base64=pdf_b64,
+        set_id=set_id,
+        model=model,
+    )
+    return await ingest_practice_content(fake_req, admin_user)
 
 
 # ─── Admin Videos endpoint ───────────────────────────────────────────────────
