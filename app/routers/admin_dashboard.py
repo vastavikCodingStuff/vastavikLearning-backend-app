@@ -503,23 +503,56 @@ async def delete_mcq(mcq_id: str, admin_user: Dict[str, Any] = Depends(require_a
 
 @router.get("/videos")
 async def list_videos(admin_user: Dict[str, Any] = Depends(require_admin_user)):
-    """All video lessons across all courses for the admin videos panel."""
+    """All video lessons for the admin videos panel.
+
+    Merges two sources so admin uploads actually appear in the list:
+      1. Curriculum lessons nested at courses/{id}/parts/{id}/subparts/{id}/lessons
+      2. Standalone uploads at the flat top-level `videos` collection (written
+         by the admin web's UploadVideoModal; these were previously invisible
+         to the list endpoint and were the cause of the "upload doesn't show"
+         bug reported by the user).
+    """
     try:
-        # Fetch all lessons from all courses/parts
-        videos = []
-        courses = db.collection("courses").stream()
-        for course in courses:
-            parts = db.collection("courses").document(course.id).collection("parts").stream()
-            for part in parts:
-                subparts = db.collection("courses").document(course.id).collection("parts").document(part.id).collection("subparts").stream()
-                for subpart in subparts:
-                    lessons = db.collection("courses").document(course.id).collection("parts").document(part.id).collection("subparts").document(subpart.id).collection("lessons").stream()
-                    for lesson in lessons:
-                        lesson_data = lesson.to_dict() | {"id": lesson.id, "course_id": course.id, "part_id": part.id}
+        videos: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+
+        # 1. Curriculum-nested lessons
+        for course in db.collection("courses").stream():
+            for part in (
+                db.collection("courses").document(course.id)
+                .collection("parts").stream()
+            ):
+                for subpart in (
+                    db.collection("courses").document(course.id)
+                    .collection("parts").document(part.id)
+                    .collection("subparts").stream()
+                ):
+                    for lesson in (
+                        db.collection("courses").document(course.id)
+                        .collection("parts").document(part.id)
+                        .collection("subparts").document(subpart.id)
+                        .collection("lessons").stream()
+                    ):
+                        lesson_data = lesson.to_dict() | {
+                            "id": lesson.id,
+                            "course_id": course.id,
+                            "part_id": part.id,
+                            "subpart_id": subpart.id,
+                            "source": "curriculum",
+                        }
                         videos.append(lesson_data)
+                        seen_ids.add(lesson.id)
+
+        # 2. Flat uploads (admin web UploadVideoModal)
+        for v in db.collection("videos").stream():
+            if v.id in seen_ids:
+                continue
+            vdata = v.to_dict() | {"id": v.id, "source": "upload"}
+            videos.append(vdata)
+            seen_ids.add(v.id)
+
         return {"videos": videos}
     except Exception as e:
-        # Fallback empty list if collections empty
         return {"videos": []}
 
 
@@ -562,6 +595,19 @@ async def create_video(body: VideoCreate, admin_user: Dict[str, Any] = Depends(r
     except Exception:
         pass
     return {"success": True, "video": data}
+
+
+@router.delete("/videos/{video_id}")
+async def delete_video(video_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    """
+    Deletes a video from the flat `videos` collection (used by the admin web
+    UploadVideoModal). Idempotent: returns success even if the doc doesn't exist.
+    """
+    try:
+        db.collection("videos").document(video_id).delete()
+        return {"success": True, "video_id": video_id, "deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/courses")
