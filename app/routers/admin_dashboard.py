@@ -721,9 +721,36 @@ def _parse_json_block(raw: str) -> Any:
 
 
 async def _call_ai_parser(prompt: str, model: str) -> str:
-    """Call Mistral (preferred) or Gemini, return raw text. Raises on failure."""
+    """Call XKIRO (preferred, OpenAI-compatible), then Mistral or Gemini. Return raw text."""
     from app.core.config import settings
     import httpx
+
+    # 1. XKIRO – OpenAI compatible, base_url must end with /v1 per docs https://docs.xkiro.com/guides/sdk-openai/
+    # Default free model per user request: minimax/minimax-m2:free
+    if settings.XKIRO_API_KEY:
+        # Use minimax free model if caller didn't specify a concrete openai/xxx model
+        xkiro_model = model if ("/" in (model or "") or model == "openai/gpt-5.6-sol") else "minimax/minimax-m2:free"
+        # If user explicitly passes generic "mistral" etc, map to minimax free
+        if model in ("mistral", "xkiro", None, ""):
+            xkiro_model = "minimax/minimax-m2:free"
+        base = (settings.XKIRO_BASE_URL or "https://api.xkiro.com/v1").rstrip("/")
+        # Ensure /v1 suffix per XKIRO docs – SDK appends /chat/completions
+        if not base.endswith("/v1"):
+            base = base + "/v1"
+        url = f"{base}/chat/completions"
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {settings.XKIRO_API_KEY}"},
+                json={
+                    "model": xkiro_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 4000,
+                },
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
 
     if model == "gemini" and settings.GEMINI_API_KEY:
         url = (
@@ -760,7 +787,7 @@ async def _call_ai_parser(prompt: str, model: str) -> str:
     raise HTTPException(
         status_code=503,
         detail=(
-            "No AI model configured. Set MISTRAL_API_KEY or GEMINI_API_KEY in backend env to enable ingest."
+            "No AI model configured. Set XKIRO_API_KEY (recommended, uses minimax/minimax-m2:free) or MISTRAL_API_KEY/GEMINI_API_KEY in backend env to enable ingest. Docs: https://docs.xkiro.com/guides/sdk-openai/"
         ),
     )
 
@@ -998,6 +1025,167 @@ async def ingest_practice_content(
             "ids": created_ids,
         }
 
+    raise HTTPException(status_code=500, detail="unreachable")
+
+
+# ─── Practice: AI Parse Preview (returns parsed JSON without saving) ─────────
+# Allows admin to review and edit AI output before committing to Firestore.
+
+async def _extract_source_text(text: Optional[str], pdf_base64: Optional[str]) -> str:
+    if text and pdf_base64:
+        raise HTTPException(status_code=400, detail="Provide only one of text or pdf_base64")
+    if pdf_base64:
+        try:
+            import base64, io
+            try:
+                from pypdf import PdfReader  # type: ignore
+            except Exception:
+                from PyPDF2 import PdfReader  # type: ignore
+            pdf_bytes = base64.b64decode(pdf_base64)
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            source = "\n\n".join((p.extract_text() or "") for p in reader.pages).strip()
+            if not source:
+                raise HTTPException(status_code=400, detail="Could not extract any text from the PDF (image-only or empty).")
+            return source
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse PDF: {e}")
+    if text:
+        return text.strip()
+    raise HTTPException(status_code=400, detail="Provide either text or pdf_base64")
+
+
+@router.post("/practice/parse")
+async def parse_practice_content(
+    body: IngestRequest,
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Parse text/PDF via XKIRO AI and return editable JSON without saving.
+    Same payload as /practice/ingest but no DB writes.
+    Returns: {success, content_type, parsed: {...}, preview: true}
+    """
+    if body.content_type not in {"quiz", "coding", "mcq", "pyq"}:
+        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq")
+    source_text = await _extract_source_text(body.text, body.pdf_base64)
+    prompt = _build_ingest_prompt(body.content_type, body.subject, source_text)
+    try:
+        raw = await _call_ai_parser(prompt, body.model or "minimax/minimax-m2:free")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI parser call failed: {e}")
+    try:
+        parsed = _parse_json_block(raw)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI returned unparseable JSON: {e}. Raw (first 200 chars): {raw[:200]}")
+    return {"success": True, "content_type": body.content_type, "parsed": parsed, "preview": True, "raw_text_preview": source_text[:2000]}
+
+
+@router.post("/practice/parse/upload")
+async def parse_practice_upload(
+    content_type: str = Form(...),
+    subject: str = Form(...),
+    title: Optional[str] = Form(None),
+    set_id: Optional[str] = Form(None),
+    model: Optional[str] = Form("minimax/minimax-m2:free"),
+    file: UploadFile = File(...),
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Multipart version of /practice/parse for direct PDF upload."""
+    if (file.content_type or "").lower() not in {"application/pdf", "application/octet-stream"}:
+        raise HTTPException(status_code=400, detail="Only PDF uploads are supported here")
+    body_bytes = await file.read()
+    import base64
+    pdf_b64 = base64.b64encode(body_bytes).decode("ascii")
+    fake_req = IngestRequest(content_type=content_type, subject=subject, title=title, pdf_base64=pdf_b64, set_id=set_id, model=model)
+    return await parse_practice_content(fake_req, admin_user)
+
+
+class SaveEditedRequest(BaseModel):
+    content_type: str  # quiz | coding | mcq | pyq
+    subject: str
+    title: Optional[str] = None
+    set_id: Optional[str] = None
+    items: List[Dict[str, Any]]  # edited items from preview
+
+
+@router.post("/practice/save")
+async def save_edited_practice_content(
+    body: SaveEditedRequest,
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Persist admin-edited items from preview. Called after user reviews AI output."""
+    if body.content_type not in {"quiz", "coding", "mcq", "pyq"}:
+        raise HTTPException(status_code=400, detail="content_type must be one of: quiz, coding, mcq, pyq")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="No items to save")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    created_ids: List[str] = []
+    if body.content_type == "quiz":
+        set_id = body.set_id or str(uuid.uuid4())
+        title = body.title or body.subject
+        set_ref = db.collection("practice_quizzes").document(set_id)
+        if not set_ref.get().exists:
+            set_ref.set({"id": set_id, "title": title, "subject": body.subject, "question_count": 0, "created_at": now_iso})
+        elif body.title:
+            set_ref.update({"title": body.title, "subject": body.subject})
+        for q in body.items:
+            qid = str(uuid.uuid4())
+            db.collection("quiz_questions").document(qid).set({
+                "id": qid, "set_id": set_id,
+                "question": str(q.get("question","")).strip(),
+                "options": [str(x) for x in (q.get("options") or [])][:6],
+                "correct_index": int(q.get("correct_index",0) or 0),
+                "explanation": str(q.get("explanation","")).strip(),
+                "subject": body.subject,
+                "difficulty": str(q.get("difficulty","easy")).lower(),
+                "created_at": now_iso,
+            })
+            created_ids.append(qid)
+        set_ref.update({"question_count": len(created_ids)})
+        return {"success": True, "content_type": "quiz", "set_id": set_id, "created_count": len(created_ids), "ids": created_ids}
+    if body.content_type == "mcq":
+        for q in body.items:
+            mid = str(uuid.uuid4())
+            db.collection("mcqs").document(mid).set({
+                "id": mid, "question": str(q.get("question","")).strip(),
+                "options": [str(x) for x in (q.get("options") or [])][:6],
+                "correct_index": int(q.get("correct_index",0) or 0),
+                "explanation": str(q.get("explanation","")).strip(),
+                "subject": body.subject, "topic": str(q.get("topic", body.subject)).strip(),
+                "difficulty": str(q.get("difficulty","easy")).lower(), "created_at": now_iso,
+            })
+            created_ids.append(mid)
+        return {"success": True, "content_type": "mcq", "created_count": len(created_ids), "ids": created_ids}
+    if body.content_type == "coding":
+        for ex in body.items:
+            eid = str(uuid.uuid4())
+            db.collection("coding_exercises").document(eid).set({
+                "id": eid, "title": str(ex.get("title","Untitled")).strip(),
+                "description": str(ex.get("description","")).strip(),
+                "language": str(ex.get("language","java")).lower(),
+                "starter_code": str(ex.get("starter_code","")).strip(),
+                "solution_code": str(ex.get("solution_code","")).strip(),
+                "test_cases": ex.get("test_cases") or [],
+                "difficulty": str(ex.get("difficulty","easy")).lower(), "created_at": now_iso,
+            })
+            created_ids.append(eid)
+        return {"success": True, "content_type": "coding", "created_count": len(created_ids), "ids": created_ids}
+    if body.content_type == "pyq":
+        for q in body.items:
+            pyq_id = f"pyq_{uuid.uuid4().hex[:10]}"
+            db.collection("pyqs").document(pyq_id).set({
+                "id": pyq_id,
+                "board": body.subject.split("|")[0].strip() if "|" in body.subject else str(q.get("board","ICSE")).strip(),
+                "year": body.subject.split("|")[1].strip() if "|" in body.subject else str(q.get("year","2024")).strip(),
+                "subject": body.subject.split("|")[2].strip() if "|" in body.subject else body.subject,
+                "question": str(q.get("question","")).strip(),
+                "solution": str(q.get("solution","")).strip(),
+                "marks": int(q.get("marks",0) or 0), "created_at": now_iso,
+            })
+            created_ids.append(pyq_id)
+        return {"success": True, "content_type": "pyq", "created_count": len(created_ids), "ids": created_ids}
     raise HTTPException(status_code=500, detail="unreachable")
 
 

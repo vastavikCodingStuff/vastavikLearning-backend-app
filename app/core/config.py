@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     # AI API Keys
     MISTRAL_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
+    XKIRO_API_KEY: Optional[str] = None
+    XKIRO_BASE_URL: str = "https://api.xkiro.com/v1"
 
     # Firebase
     FIREBASE_CREDENTIALS_PATH: Optional[str] = "serviceAccountKey.json"
