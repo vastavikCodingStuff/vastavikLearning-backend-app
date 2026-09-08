@@ -578,3 +578,42 @@ async def create_course(body: CourseCreate, admin_user: Dict[str, Any] = Depends
         pass
     return {"success": True, "course": data}
 
+
+class LessonLinkCreate(BaseModel):
+    title: str
+    lesson_id: str
+
+
+@router.post("/courses/{course_id}/parts/{part_id}/lessons")
+async def add_lesson_to_part(
+    course_id: str,
+    part_id: str,
+    body: LessonLinkCreate,
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """
+    Links a video lesson into a curriculum part by creating a subpart entry.
+    Called by the Next.js admin curriculum editor (useCourses.addLessonToPart).
+    Returns 404 if the course part does not exist (prevents orphaned subparts).
+    """
+    try:
+        part_ref = (
+            db.collection("courses").document(course_id)
+            .collection("parts").document(part_id)
+        )
+        part_doc = part_ref.get()
+        if not part_doc.exists:
+            raise HTTPException(status_code=404, detail="Course part not found")
+        sub_id = f"sub_{uuid.uuid4().hex[:10]}"
+        subpart = {
+            "subpart_id": sub_id,
+            "title": body.title,
+            "lesson_id": body.lesson_id,
+        }
+        part_ref.collection("subparts").document(sub_id).set(subpart)
+        return {"success": True, "subpart": subpart}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
