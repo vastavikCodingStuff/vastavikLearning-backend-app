@@ -775,7 +775,7 @@ async def _call_ai_parser(prompt: str, model: str) -> str:
                 "https://api.mistral.ai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {settings.MISTRAL_API_KEY}"},
                 json={
-                    "model": "mistral-small-latest",
+                    "model": "mistral-large-latest",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.1,
                     "max_tokens": 4000,
