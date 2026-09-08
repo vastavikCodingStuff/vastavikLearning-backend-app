@@ -68,9 +68,31 @@ async def signup(request: SignupRequest):
         "subscription_expires_at": None,
         "streak_count": 1,
         "total_lessons_completed": 0,
+        "credit_balance": 0.0,
+        "access_type": "free",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.save_user(user_data)
+
+    if request.referral_code:
+        try:
+            from app.services.growth_service import attribute_referral_on_signup
+            await attribute_referral_on_signup(uid, request.referral_code.strip().upper(), request.device_fingerprint or "")
+        except Exception:
+            pass
+    elif request.share_token:
+        try:
+            from app.services.growth_service import attribute_share_on_signup
+            await attribute_share_on_signup(uid, request.share_token.strip())
+        except Exception:
+            pass
+
+    if request.device_fingerprint:
+        try:
+            from app.services.device_service import bind_device
+            await bind_device(uid, request.device_fingerprint, request.device_name or "", request.platform or "")
+        except Exception:
+            pass
 
     tv = await get_token_version(uid)
     token_payload = {"sub": uid, "email": request.email, "role": "student", "name": request.name}

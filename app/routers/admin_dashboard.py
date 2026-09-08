@@ -17,6 +17,31 @@ from app.db.firebase import db
 router = APIRouter(prefix="/admin", tags=["Admin Dashboard — Extended"])
 
 
+# ─── Response normalization helpers ───────────────────────────────────────────
+
+def _normalize_student(doc_data: Dict[str, Any], doc_id: str) -> Dict[str, Any]:
+    """
+    Map a raw Firestore user document onto the StudentProfile contract consumed by
+    the Next.js admin frontend (see types/api.ts → StudentProfile).
+
+    Firestore stores `total_lessons_completed` and `student_class`; the frontend
+    expects `lessons_completed` and `class_grade`. The doc id is also exposed
+    as `uid` so it survives even if the doc field is missing.
+    """
+    normalized: Dict[str, Any] = dict(doc_data)
+    normalized.setdefault("uid", doc_id)
+    if "total_lessons_completed" in normalized and "lessons_completed" not in normalized:
+        normalized["lessons_completed"] = normalized["total_lessons_completed"]
+    if "student_class" in normalized and "class_grade" not in normalized:
+        normalized["class_grade"] = normalized["student_class"]
+    normalized.setdefault("lessons_completed", 0)
+    normalized.setdefault("streak_count", 0)
+    normalized.setdefault("is_premium", False)
+    normalized.setdefault("subscription_expires_at", None)
+    normalized.setdefault("payment_details", [])
+    return normalized
+
+
 # ─── Pydantic models ──────────────────────────────────────────────────────────
 
 class BugReportStatusUpdate(BaseModel):
@@ -110,7 +135,7 @@ async def list_students(
     """List all students with optional name/email search and pagination."""
     try:
         ref = db.collection("users").where("role", "==", "student")
-        docs = [d.to_dict() for d in ref.stream()]
+        docs = [_normalize_student(d.to_dict(), d.id) for d in ref.stream()]
 
         if search:
             q = search.lower()
@@ -138,7 +163,7 @@ async def get_student(uid: str, admin_user: Dict[str, Any] = Depends(require_adm
         doc = db.collection("users").document(uid).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail="Student not found")
-        student = doc.to_dict()
+        student = _normalize_student(doc.to_dict(), doc.id)
 
         # Fetch payment history
         txns = db.collection("transactions").where("uid", "==", uid).stream()
@@ -279,28 +304,52 @@ async def update_bug_report(
 
 # ─── Completion Stats ─────────────────────────────────────────────────────────
 
+async def _compute_course_completion(course_id: str, course_title: str) -> Dict[str, Any]:
+    """
+    Compute real completion stats for a course by joining:
+      - curriculum (parts/subparts from courses/{id}/parts/...)
+      - per-student visitedParts (from studentSelections/{uid}.visitedParts)
+
+    Returns a dict matching the CourseCompletionOverview contract consumed by
+    the Next.js admin frontend.
+    """
+    parts = await db.get_course_curriculum(course_id)
+    total_parts = len(parts)
+
+    user_docs = db.collection("users").where("role", "==", "student").stream()
+    per_student_percent: List[float] = []
+    for u_doc in user_docs:
+        visited = await db.get_visited_parts(u_doc.id)
+        prefix = f"{course_id}::"
+        completed = sum(1 for v in visited if isinstance(v, str) and v.startswith(prefix))
+        if completed == 0 and total_parts > 0:
+            continue
+        if total_parts == 0:
+            continue
+        per_student_percent.append(round((completed / total_parts) * 100.0, 1))
+
+    enrolled = len(per_student_percent)
+    avg = round(sum(per_student_percent) / enrolled, 1) if enrolled else 0.0
+    fully_done = sum(1 for p in per_student_percent if p >= 100.0)
+
+    return {
+        "course_id": course_id,
+        "course_title": course_title,
+        "enrolled_students": enrolled,
+        "avg_completion_percent": avg,
+        "fully_completed_count": fully_done,
+    }
+
+
 @router.get("/completion/overview")
 async def get_completion_overview(admin_user: Dict[str, Any] = Depends(require_admin_user)):
-    """Average completion percentage per course."""
+    """Average completion percentage per course, computed from real visitedParts data."""
     try:
         courses = [d.to_dict() | {"id": d.id} for d in db.collection("courses").stream()]
-        result = []
+        overview: List[Dict[str, Any]] = []
         for course in courses:
-            completions = db.collection("course_completions").where("course_id", "==", course["id"]).stream()
-            completion_docs = [c.to_dict() for c in completions]
-            if completion_docs:
-                avg = sum(c.get("completion_percent", 0) for c in completion_docs) / len(completion_docs)
-                fully_done = sum(1 for c in completion_docs if c.get("completion_percent", 0) >= 100)
-            else:
-                avg, fully_done = 0.0, 0
-            result.append({
-                "course_id": course["id"],
-                "course_title": course.get("title", ""),
-                "enrolled_students": len(completion_docs),
-                "avg_completion_percent": round(avg, 1),
-                "fully_completed_count": fully_done,
-            })
-        return {"overview": result}
+            overview.append(await _compute_course_completion(course["id"], course.get("title", "")))
+        return {"overview": overview}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -310,12 +359,48 @@ async def get_top_students(
     limit: int = Query(10, ge=1, le=100),
     admin_user: Dict[str, Any] = Depends(require_admin_user),
 ):
-    """Top performing students by completion percentage."""
+    """
+    Top performing students by completion percentage, computed from real
+    visitedParts data joined with curriculum + course titles.
+    """
     try:
-        docs = db.collection("course_completions").stream()
-        stats = [d.to_dict() for d in docs]
-        stats.sort(key=lambda x: x.get("completion_percent", 0), reverse=True)
-        return {"stats": stats[:limit]}
+        courses = {d.id: d.to_dict().get("title", d.id) for d in db.collection("courses").stream()}
+
+        user_docs = db.collection("users").where("role", "==", "student").stream()
+        rows: List[Dict[str, Any]] = []
+        for u_doc in user_docs:
+            uid = u_doc.id
+            user = u_doc.to_dict()
+            visited = await db.get_visited_parts(uid)
+            if not visited:
+                continue
+            by_course: Dict[str, int] = {}
+            for v in visited:
+                if not isinstance(v, str) or "::" not in v:
+                    continue
+                cid, _ = v.split("::", 1)
+                by_course[cid] = by_course.get(cid, 0) + 1
+
+            best_course_id = max(by_course, key=by_course.get) if by_course else None
+            if not best_course_id:
+                continue
+            parts = await db.get_course_curriculum(best_course_id)
+            total_parts = len(parts)
+            completed_parts = by_course[best_course_id]
+            percent = round((completed_parts / total_parts) * 100.0, 1) if total_parts else 0.0
+            rows.append({
+                "uid": uid,
+                "student_name": user.get("name", "Student"),
+                "course_id": best_course_id,
+                "course_title": courses.get(best_course_id, best_course_id),
+                "total_parts": total_parts,
+                "completed_parts": completed_parts,
+                "completion_percent": percent,
+                "last_activity": user.get("updated_at") or user.get("created_at") or "",
+            })
+
+        rows.sort(key=lambda r: r["completion_percent"], reverse=True)
+        return {"stats": rows[:limit]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
