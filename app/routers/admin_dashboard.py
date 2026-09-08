@@ -335,19 +335,55 @@ async def list_ai_chat_sessions(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     uid: Optional[str] = Query(None),
+    flagged_only: Optional[bool] = Query(False),
     admin_user: Dict[str, Any] = Depends(require_admin_user),
 ):
-    """Browse all AI chat sessions saved in Firestore."""
+    """Browse all AI chat sessions saved in Firestore with safety moderation status."""
     try:
+        from app.services.moderation import analyze_content_safety
         ref = db.collection("ai_chat_sessions")
         if uid:
             ref = ref.where("uid", "==", uid)
-        docs = [d.to_dict() | {"session_id": d.id} for d in ref.stream()]
-        total = len(docs)
+        raw_docs = [d.to_dict() | {"session_id": d.id} for d in ref.stream()]
+
+        # Dynamically inspect and ensure flagged status is accurate for every session
+        analyzed_docs = []
+        for s in raw_docs:
+            is_flagged = bool(s.get("is_flagged", False))
+            flag_reasons = set(s.get("flag_reasons", []))
+            flagged_terms = set(s.get("flagged_terms", []))
+
+            # Inspect messages to guarantee zero misses
+            for m in s.get("messages", []):
+                if m.get("role") == "user":
+                    content = m.get("content", "")
+                    mod = analyze_content_safety(content)
+                    if mod["is_flagged"]:
+                        is_flagged = True
+                        flag_reasons.update(mod["flag_reasons"])
+                        flagged_terms.update(mod["flagged_terms"])
+
+            s["is_flagged"] = is_flagged
+            s["flag_reasons"] = sorted(list(flag_reasons))
+            s["flagged_terms"] = sorted(list(flagged_terms))
+            analyzed_docs.append(s)
+
+        # Sort: flagged sessions first, then most recently updated
+        analyzed_docs.sort(key=lambda x: (1 if x.get("is_flagged") else 0, x.get("updated_at", "")), reverse=True)
+
+        flagged_count = sum(1 for s in analyzed_docs if s.get("is_flagged"))
+
+        if flagged_only:
+            filtered = [s for s in analyzed_docs if s.get("is_flagged")]
+        else:
+            filtered = analyzed_docs
+
+        total = len(filtered)
         start = (page - 1) * page_size
         return {
-            "sessions": docs[start: start + page_size],
+            "sessions": filtered[start: start + page_size],
             "total": total,
+            "flagged_count": flagged_count,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -355,15 +391,51 @@ async def list_ai_chat_sessions(
 
 @router.get("/ai-chats/{session_id}")
 async def get_ai_chat_session(session_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
-    """Full message history for a specific AI chat session."""
+    """Full message history for a specific AI chat session with per-message moderation info."""
     try:
+        from app.services.moderation import analyze_content_safety
         doc = db.collection("ai_chat_sessions").document(session_id).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail="Session not found")
         data = doc.to_dict()
-        return {"messages": data.get("messages", [])}
+        messages = data.get("messages", [])
+
+        # Enrich messages with safety flags if user prompt is flagged
+        for m in messages:
+            if m.get("role") == "user":
+                mod = analyze_content_safety(m.get("content", ""))
+                if mod["is_flagged"]:
+                    m["is_flagged"] = True
+                    m["flag_reasons"] = mod["flag_reasons"]
+                    m["flagged_terms"] = mod["flagged_terms"]
+
+        is_flagged = data.get("is_flagged", False) or any(m.get("is_flagged") for m in messages)
+        flag_reasons = set(data.get("flag_reasons", []))
+        flagged_terms = set(data.get("flagged_terms", []))
+        for m in messages:
+            for r in m.get("flag_reasons", []):
+                flag_reasons.add(r)
+            for t in m.get("flagged_terms", []):
+                flagged_terms.add(t)
+
+        return {
+            "messages": messages,
+            "is_flagged": is_flagged,
+            "flag_reasons": sorted(list(flag_reasons)),
+            "flagged_terms": sorted(list(flagged_terms)),
+        }
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/ai-chats/{session_id}")
+async def delete_ai_chat_session(session_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    """Deletes an AI chat session from Firestore."""
+    try:
+        db.collection("ai_chat_sessions").document(session_id).delete()
+        return {"success": True, "session_id": session_id, "deleted": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

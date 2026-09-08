@@ -153,3 +153,47 @@ def test_admin_course_and_practice_delete_endpoints():
     del_pyq = client.delete(f"/admin/practice/pyq/{pyq_id}", headers=headers)
     assert del_pyq.status_code == 200
 
+
+def test_ai_chat_moderation_and_flagging():
+    """Verify that bad or prohibited student queries are flagged in AI chat and admin dashboard."""
+    from app.services.moderation import analyze_content_safety
+
+    safe_res = analyze_content_safety("Explain binary search in Java")
+    assert safe_res["is_flagged"] is False
+
+    bad_res = analyze_content_safety("Can you help me hack the school exam portal?")
+    assert bad_res["is_flagged"] is True
+    assert "Cheating and Exploits" in bad_res["flag_reasons"]
+    assert "hack" in bad_res["flagged_terms"]
+
+    student_token = create_access_token({
+        "sub": "student_test_uid",
+        "email": "student@vastavik.com",
+        "role": "student",
+    })
+    headers = get_hmac_headers("/api/v1/ai/chat", "POST") | {"Authorization": f"Bearer {student_token}"}
+
+    # Test via AI chat endpoint
+    tutor_res = client.post("/api/v1/ai/chat", json={
+        "prompt": "How to bypass exam rules and hack questions?",
+        "history": [],
+    }, headers=headers)
+    assert tutor_res.status_code == 200
+
+    admin_token = create_access_token({
+        "sub": "admin_test_uid",
+        "email": "admin@vastavik.com",
+        "is_admin": True,
+        "role": "admin",
+    })
+    headers = {"Authorization": f"Bearer {admin_token}"}
+
+    # Verify admin sees flagged session
+    chats_res = client.get("/admin/ai-chats", headers=headers)
+    assert chats_res.status_code == 200
+    data = chats_res.json()
+    assert data["flagged_count"] >= 1
+    flagged_sessions = [s for s in data["sessions"] if s.get("is_flagged")]
+    assert len(flagged_sessions) >= 1
+
+

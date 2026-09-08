@@ -323,6 +323,7 @@ async def ai_chat(request: ChatRequest, current_user: Optional[Dict[str, Any]] =
     # Save chat session to Firestore for admin dashboard visibility
     try:
         from app.db.firebase import db
+        from app.services.moderation import analyze_content_safety
         from datetime import datetime, timezone
         uid = current_user.get("uid", "guest_user") if current_user else "guest_user"
         student_name = current_user.get("name", "Student") if current_user else "Student"
@@ -330,25 +331,52 @@ async def ai_chat(request: ChatRequest, current_user: Optional[Dict[str, Any]] =
         session_ref = db.collection("ai_chat_sessions").document(session_id)
         existing = session_ref.get()
         new_messages = list(request.history or [])
-        new_messages.append({"role": "user", "content": request.prompt, "timestamp": datetime.now(timezone.utc).isoformat()})
-        new_messages.append({"role": "assistant", "content": reply, "timestamp": datetime.now(timezone.utc).isoformat(), "model": model_used})
+
+        # Analyze prompt for safety moderation
+        mod = analyze_content_safety(request.prompt)
+        user_msg = {
+            "role": "user",
+            "content": request.prompt,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "is_flagged": mod["is_flagged"],
+            "flag_reasons": mod["flag_reasons"],
+            "flagged_terms": mod["flagged_terms"],
+        }
+        new_messages.append(user_msg)
+        new_messages.append({
+            "role": "assistant",
+            "content": reply,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model": model_used
+        })
+
+        any_flagged = any(m.get("is_flagged") for m in new_messages) or mod["is_flagged"]
+        all_reasons = set(mod["flag_reasons"])
+        all_terms = set(mod["flagged_terms"])
+        for m in new_messages:
+            for r in m.get("flag_reasons", []):
+                all_reasons.add(r)
+            for t in m.get("flagged_terms", []):
+                all_terms.add(t)
+
+        update_payload = {
+            "messages": new_messages,
+            "message_count": len(new_messages),
+            "model_used": model_used,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "is_flagged": any_flagged,
+            "flag_reasons": sorted(list(all_reasons)),
+            "flagged_terms": sorted(list(all_terms)),
+        }
+
         if existing.exists:
-            session_ref.update({
-                "messages": new_messages,
-                "message_count": len(new_messages),
-                "model_used": model_used,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+            session_ref.update(update_payload)
         else:
-            session_ref.set({
+            session_ref.set(update_payload | {
                 "session_id": session_id,
                 "uid": uid,
                 "student_name": student_name,
-                "model_used": model_used,
-                "messages": new_messages,
-                "message_count": len(new_messages),
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
             })
     except Exception as e:
         logger.warning(f"Failed to save AI chat session: {e}")
@@ -364,14 +392,33 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
     """
     try:
         from app.db.firebase import db
+        from app.services.moderation import analyze_content_safety
         from datetime import datetime, timezone
         conv_id = payload.get("conversationId") or f"conv_{int(datetime.now().timestamp())}"
         title = payload.get("title", "Student Chat")
-        messages = payload.get("messages", [])
+        raw_messages = payload.get("messages", [])
         app_version = payload.get("appVersion", "")
         device_model = payload.get("deviceModel", "")
         uid = current_user.get("uid", "student") if current_user else "student"
         student_name = current_user.get("name", "Student") if current_user else "Student"
+
+        flagged_reasons = set()
+        flagged_terms = set()
+        is_conv_flagged = False
+        enriched_messages = []
+
+        for m in raw_messages:
+            content = m.get("content", "")
+            if m.get("role") == "user":
+                mod = analyze_content_safety(content)
+                if mod["is_flagged"]:
+                    is_conv_flagged = True
+                    flagged_reasons.update(mod["flag_reasons"])
+                    flagged_terms.update(mod["flagged_terms"])
+                    m["is_flagged"] = True
+                    m["flag_reasons"] = mod["flag_reasons"]
+                    m["flagged_terms"] = mod["flagged_terms"]
+            enriched_messages.append(m)
 
         doc_ref = db.collection("ai_chat_sessions").document(conv_id)
         doc_ref.set({
@@ -379,14 +426,17 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
             "uid": uid,
             "student_name": student_name,
             "title": title,
-            "messages": messages,
-            "message_count": len(messages),
+            "messages": enriched_messages,
+            "message_count": len(enriched_messages),
             "app_version": app_version,
             "device_model": device_model,
+            "is_flagged": is_conv_flagged,
+            "flag_reasons": sorted(list(flagged_reasons)),
+            "flagged_terms": sorted(list(flagged_terms)),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "created_at": datetime.now(timezone.utc).isoformat()
         }, merge=True)
-        return {"status": "synced", "conversation_id": conv_id}
+        return {"status": "synced", "conversation_id": conv_id, "is_flagged": is_conv_flagged}
     except Exception as e:
         logger.warning(f"Telemetry sync error: {e}")
         return {"status": "error", "detail": str(e)}
