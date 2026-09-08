@@ -5,9 +5,12 @@ completion stats, and practice content (quiz/coding/MCQ) CRUD.
 All routes require admin JWT claim.
 """
 import json
+import logging
 import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
+
+logger = logging.getLogger("vastavik.admin_dashboard")
 
 from fastapi import APIRouter, HTTPException, status, Depends, Query, UploadFile, File, Form
 from pydantic import BaseModel
@@ -727,32 +730,46 @@ async def _call_ai_parser(prompt: str, model: str) -> str:
 
     last_error = None
 
-    # 1. XKIRO – OpenAI compatible, default free model: minimax/minimax-m2:free
+    # 1. XKIRO – OpenAI compatible
     if settings.XKIRO_API_KEY:
-        try:
-            xkiro_model = model if ("/" in (model or "") or model == "openai/gpt-5.6-sol") else "minimax/minimax-m2:free"
-            if model in ("mistral", "xkiro", None, ""):
-                xkiro_model = "minimax/minimax-m2:free"
-            base = (settings.XKIRO_BASE_URL or "https://api.xkiro.com/v1").rstrip("/")
-            if not base.endswith("/v1"):
-                base = base + "/v1"
-            url = f"{base}/chat/completions"
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                r = await client.post(
-                    url,
-                    headers={"Authorization": f"Bearer {settings.XKIRO_API_KEY}"},
-                    json={
-                        "model": xkiro_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "max_tokens": 4000,
-                    },
-                )
-                r.raise_for_status()
-                return r.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            logger.warning(f"XKIRO parser call failed: {e}. Trying fallback providers...")
-            last_error = f"XKIRO: {e}"
+        base = (settings.XKIRO_BASE_URL or "https://api.xkiro.com/v1").rstrip("/")
+        if not base.endswith("/v1"):
+            base = base + "/v1"
+        url = f"{base}/chat/completions"
+
+        candidate_models = []
+        if model and ("/" in model or model == "openai/gpt-5.6-sol"):
+            candidate_models.append(model)
+        candidate_models.extend([
+            "qwen/qwen3.5-flash:free",
+            "minimax/minimax-m2.5-highspeed:free",
+            "minimax/minimax-m2:free",
+        ])
+
+        for xkiro_model in candidate_models:
+            try:
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    r = await client.post(
+                        url,
+                        headers={"Authorization": f"Bearer {settings.XKIRO_API_KEY}"},
+                        json={
+                            "model": xkiro_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1,
+                            "max_tokens": 4000,
+                        },
+                    )
+                    r.raise_for_status()
+                    msg = r.json()["choices"][0]["message"]
+                    content = msg.get("content") or ""
+                    if not content.strip() and msg.get("reasoning_content"):
+                        content = msg.get("reasoning_content") or ""
+                    if content.strip():
+                        return content
+            except Exception as e:
+                logger.warning(f"XKIRO model '{xkiro_model}' failed: {e}. Trying next model...")
+                last_error = f"XKIRO ({xkiro_model}): {e}"
+                continue
 
     if (model == "gemini" or not settings.XKIRO_API_KEY) and settings.GEMINI_API_KEY:
         try:
