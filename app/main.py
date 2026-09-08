@@ -87,6 +87,14 @@ async def hmac_verification_middleware(request: Request, call_next):
     Validates HMAC-SHA256 signature and 5-minute replay prevention headers
     on API requests when ENFORCE_HMAC is enabled in settings.
     """
+    # CORS preflight never carries HMAC headers and must always pass through
+    # so the browser can decide whether the actual cross-origin request is
+    # allowed. Without this, every Vercel/Netlify/custom-domain caller would
+    # see the OPTIONS 401 and the browser would block the real GET, causing
+    # the admin web to fall through to its offline-cache code path.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     path = request.url.path
     # Bypass endpoints that shouldn't require HMAC signatures
     bypass_paths = [
