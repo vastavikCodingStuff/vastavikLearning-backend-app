@@ -197,3 +197,100 @@ def test_ai_chat_moderation_and_flagging():
     assert len(flagged_sessions) >= 1
 
 
+def test_student_ban_archive_and_purge():
+    """Verify that deleting a student archives data separately, purges active storage, revokes sessions, and blocks logins."""
+    from app.db.firebase import db
+    from app.core.security import hash_password, generate_salt
+
+    test_uid = f"usr_test_ban_{int(time.time())}"
+    test_email = f"ban_target_{int(time.time())}@gmail.com"
+    salt = generate_salt()
+    pw_hash = hash_password("secretpassword123", salt)
+
+    # 1. Create active student record
+    db.collection("users").document(test_uid).set({
+        "uid": test_uid,
+        "name": "Banned Student Test",
+        "email": test_email,
+        "password_hash": pw_hash,
+        "salt": salt,
+        "role": "student",
+        "streak_count": 5,
+        "total_lessons_completed": 12,
+    })
+    db.collection("studentSelections").document(test_uid).set({
+        "uid": test_uid,
+        "email": test_email,
+        "selected_board": "ICSE",
+    })
+
+    # Student token
+    student_token = create_access_token({
+        "sub": test_uid,
+        "email": test_email,
+        "role": "student",
+    })
+
+    admin_token = create_access_token({
+        "sub": "admin_test_uid",
+        "email": "admin@vastavik.com",
+        "is_admin": True,
+        "role": "admin",
+    })
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    # 2. Admin calls DELETE /admin/students/{uid}
+    del_res = client.delete(f"/admin/students/{test_uid}", headers=admin_headers)
+    assert del_res.status_code == 200
+    del_data = del_res.json()
+    assert del_data["success"] is True
+    assert del_data["status"] == "banned_and_archived"
+
+    # 3. Verify active collections are wiped
+    assert not db.collection("users").document(test_uid).get().exists
+    assert not db.collection("studentSelections").document(test_uid).get().exists
+
+    # 4. Verify separate archive contains full snapshot
+    arch_doc = db.collection("deleted_students_archive").document(test_uid).get()
+    assert arch_doc.exists
+    arch_data = arch_doc.to_dict()
+    assert arch_data["email"] == test_email
+    assert arch_data["status"] == "banned_and_archived"
+    assert arch_data["user_data"]["streak_count"] == 5
+
+    # 5. Verify banned_students registry has record
+    assert db.collection("banned_students").document(test_uid).get().exists
+
+    # 6. Verify GET /admin/students/archived returns the student
+    arch_list_res = client.get("/admin/students/archived", headers=admin_headers)
+    assert arch_list_res.status_code == 200
+    items = arch_list_res.json()["items"]
+    assert any(i["uid"] == test_uid for i in items)
+
+    # 7. Verify GET /admin/students/archived/{uid} returns details
+    arch_get_res = client.get(f"/admin/students/archived/{test_uid}", headers=admin_headers)
+    assert arch_get_res.status_code == 200
+    assert arch_get_res.json()["uid"] == test_uid
+
+    # 8. Verify authenticated endpoint rejects banned student token with 403 ACCOUNT_BANNED
+    banned_headers = {"Authorization": f"Bearer {student_token}"}
+    status_res = client.get("/api/v1/auth/account-status", headers=banned_headers)
+    assert status_res.status_code == 403
+    assert "ACCOUNT_BANNED" in status_res.json()["detail"]
+
+    # 9. Verify login attempt with banned email is rejected with 403 ACCOUNT_BANNED
+    login_headers = get_hmac_headers("/api/v1/auth/login", "POST")
+    login_res = client.post("/api/v1/auth/login", json={
+        "email": test_email,
+        "password": "secretpassword123",
+    }, headers=login_headers)
+    assert login_res.status_code == 403
+    assert "ACCOUNT_BANNED" in login_res.json()["detail"]
+
+    # Cleanup test archive & ban record
+    db.collection("deleted_students_archive").document(test_uid).delete()
+    db.collection("banned_students").document(test_uid).delete()
+    db.collection("banned_students").document(f"email_{test_email}").delete()
+
+
+

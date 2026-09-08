@@ -131,6 +131,25 @@ async def login(request: LoginRequest):
             role="admin",
         )
 
+    # Check if email or user is registered in banned_students
+    try:
+        from app.db.firebase import db as raw_firestore
+        cleaned_email = request.email.lower().strip()
+        b_doc = raw_firestore.collection("banned_students").document(f"email_{cleaned_email}").get()
+        if not b_doc.exists:
+            matches = list(raw_firestore.collection("banned_students").where("email", "==", cleaned_email).limit(1).stream())
+            if matches:
+                b_doc = matches[0]
+        if b_doc and b_doc.exists:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="ACCOUNT_BANNED: This account has been banned and deleted by the administrator. Please register with a new account.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
     user = await db.get_user_by_email(request.email)
     if not user:
         raise HTTPException(
@@ -451,4 +470,45 @@ async def update_profile(
 
     # Return refreshed profile
     return await get_profile(current_user=current_user)
+
+
+@router.get("/auth/account-status")
+async def get_account_status(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Validates whether the current student session is active.
+    If the student was banned or deleted by an admin, raises HTTP 403 or 401.
+    """
+    uid = current_user.get("sub")
+    if uid == "admin_master":
+        return {"status": "active", "role": "admin"}
+
+    # Check if student UID is in banned_students
+    try:
+        from app.db.firebase import db as raw_firestore
+        b_doc = raw_firestore.collection("banned_students").document(uid).get()
+        if b_doc.exists:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="ACCOUNT_BANNED: Your account has been banned and deleted by the administrator.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # Check if user document still exists in active users
+    user = await db.get_user_by_id(uid)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="ACCOUNT_DELETED: User account has been removed. Please register a new account.",
+        )
+
+    return {
+        "status": "active",
+        "uid": uid,
+        "name": user.get("name"),
+        "email": user.get("email"),
+        "role": user.get("role", "student"),
+    }
 

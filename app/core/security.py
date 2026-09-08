@@ -100,6 +100,21 @@ async def get_current_user(
     uid = payload.get("sub")
     tv = payload.get("tv", 0)
     if uid and uid != "admin_master":
+        # Check if user is in banned_students
+        try:
+            from app.db.firebase import db
+            banned_doc = db.collection("banned_students").document(uid).get()
+            if banned_doc.exists:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="ACCOUNT_BANNED: Your account has been banned and deleted by the administrator.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
         # The single global admin uid ("admin_master") is intentionally exempt from
         # the in-memory token_version check: revocations on this uid would otherwise
         # silently boot every active admin session across all admins on every device.

@@ -281,6 +281,59 @@ async def list_students(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/students/archived")
+async def list_archived_students(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Lists all students whose accounts have been banned and archived separately."""
+    try:
+        ref = db.collection("deleted_students_archive")
+        docs = [d.to_dict() | {"uid": d.id} for d in ref.stream()]
+        docs.sort(key=lambda x: x.get("archived_at", ""), reverse=True)
+
+        if search:
+            q = search.lower()
+            docs = [
+                d for d in docs
+                if q in d.get("name", "").lower()
+                or q in d.get("email", "").lower()
+                or q in d.get("uid", "").lower()
+            ]
+
+        total = len(docs)
+        start = (page - 1) * page_size
+        items = docs[start : start + page_size]
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total + page_size - 1) // page_size if page_size > 0 else 1,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/students/archived/{uid}")
+async def get_archived_student(
+    uid: str,
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Retrieves full snapshot details of an archived/banned student."""
+    try:
+        doc = db.collection("deleted_students_archive").document(uid).get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Archived student not found")
+        return doc.to_dict() | {"uid": doc.id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/students/{uid}")
 async def get_student(uid: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
     """Full student profile + payment history."""
@@ -309,8 +362,80 @@ async def get_student(uid: str, admin_user: Dict[str, Any] = Depends(require_adm
 
 @router.delete("/students/{uid}")
 async def delete_student(uid: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
-    """Deletes a student and cascades to their selections, notes, chats, etc."""
+    """
+    Permanently bans and deletes a student from active collections,
+    archives full snapshot to deleted_students_archive, and revokes all active sessions.
+    """
     try:
+        user_doc = db.collection("users").document(uid).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+
+        sel_doc = db.collection("studentSelections").document(uid).get()
+        sel_data = sel_doc.to_dict() if sel_doc.exists else None
+
+        notes_data = [n.to_dict() for n in db.collection("notes").where("uid", "==", uid).stream()]
+        txns_data = [t.to_dict() for t in db.collection("transactions").where("uid", "==", uid).stream()]
+        chats_data = []
+        for c in db.collection("ai_chat_sessions").where("student_id", "==", uid).stream():
+            chats_data.append(c.to_dict() | {"session_id": c.id})
+        for c in db.collection("ai_chat_sessions").where("uid", "==", uid).stream():
+            if not any(x.get("session_id") == c.id for x in chats_data):
+                chats_data.append(c.to_dict() | {"session_id": c.id})
+
+        email = user_data.get("email") or (sel_data.get("email") if sel_data else "") or ""
+        name = user_data.get("name") or (sel_data.get("name") if sel_data else "Student")
+        archived_at = datetime.now(timezone.utc).isoformat()
+        admin_email = admin_user.get("email") or "admin"
+
+        # 1. Archive full snapshot into separate storage/collection
+        archive_payload = {
+            "uid": uid,
+            "email": email,
+            "name": name,
+            "status": "banned_and_archived",
+            "reason": "Banned and deleted by administrator",
+            "archived_at": archived_at,
+            "banned_by": admin_email,
+            "user_data": user_data,
+            "student_selections": sel_data,
+            "notes_count": len(notes_data),
+            "transactions_count": len(txns_data),
+            "chats_count": len(chats_data),
+            "notes": notes_data,
+            "transactions": txns_data,
+            "chats": chats_data,
+        }
+        db.collection("deleted_students_archive").document(uid).set(archive_payload)
+
+        # 2. Add to banned_students registry
+        ban_record = {
+            "uid": uid,
+            "email": email.lower() if email else "",
+            "name": name,
+            "banned_at": archived_at,
+            "banned_by": admin_email,
+            "reason": "Banned and deleted by administrator",
+            "status": "banned",
+        }
+        db.collection("banned_students").document(uid).set(ban_record)
+        if email:
+            db.collection("banned_students").document(f"email_{email.lower()}").set(ban_record)
+
+        # 3. Revoke active JWT sessions / token versions
+        try:
+            from app.services.device_service import revoke_user_sessions
+            await revoke_user_sessions(uid)
+        except Exception:
+            pass
+
+        # 4. Attempt Firebase Auth deletion if available
+        try:
+            from firebase_admin import auth as fb_auth
+            fb_auth.delete_user(uid)
+        except Exception:
+            pass
+
+        # 5. Purge from active operational collections
         db.collection("users").document(uid).delete()
         db.collection("studentSelections").document(uid).delete()
         db.collection("refreshTokens").document(uid).delete()
@@ -322,7 +447,16 @@ async def delete_student(uid: str, admin_user: Dict[str, Any] = Depends(require_
             c.reference.delete()
         for c in db.collection("ai_chat_sessions").where("uid", "==", uid).stream():
             c.reference.delete()
-        return {"success": True, "uid": uid, "deleted": True}
+        for d in db.collection("device_bindings").where("uid", "==", uid).stream():
+            d.reference.delete()
+
+        return {
+            "success": True,
+            "uid": uid,
+            "status": "banned_and_archived",
+            "archived_at": archived_at,
+            "message": "Student has been banned, all active data purged, and record archived separately."
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
