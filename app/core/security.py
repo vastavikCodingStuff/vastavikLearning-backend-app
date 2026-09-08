@@ -99,7 +99,11 @@ async def get_current_user(
         )
     uid = payload.get("sub")
     tv = payload.get("tv", 0)
-    if uid:
+    if uid and uid != "admin_master":
+        # The single global admin uid ("admin_master") is intentionally exempt from
+        # the in-memory token_version check: revocations on this uid would otherwise
+        # silently boot every active admin session across all admins on every device.
+        # Admin sessions are managed by the standard JWT expiry + refresh flow.
         from app.services.device_service import REVOKED_TOKEN_VERSIONS
         current_tv = REVOKED_TOKEN_VERSIONS.get(uid, 0)
         if tv < current_tv:
