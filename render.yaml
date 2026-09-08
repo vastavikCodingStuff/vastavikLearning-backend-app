@@ -26,6 +26,8 @@ services:
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: XKIRO_API_KEY
-        sync: false
+        value: sk-xt-075d80d397e9a363d923b80bd53d65c01463b37b28f60dae
       - key: XKIRO_BASE_URL
         value: https://api.xkiro.com/v1
+      - key: MISTRAL_API_KEY
+        value: WKifALNZPu4xSxRDeNu0vVumvbjvqao1
