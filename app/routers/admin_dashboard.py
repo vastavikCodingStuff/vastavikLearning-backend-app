@@ -582,6 +582,33 @@ async def add_quiz_question(set_id: str, body: QuizQuestionCreate, admin_user: D
     return data
 
 
+@router.delete("/practice/quiz/{set_id}")
+async def delete_quiz_set(set_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    """Deletes a quiz set and all its questions."""
+    try:
+        db.collection("practice_quizzes").document(set_id).delete()
+        for q in db.collection("quiz_questions").where("set_id", "==", set_id).stream():
+            q.reference.delete()
+        return {"success": True, "set_id": set_id, "deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/practice/quiz/{set_id}/questions/{question_id}")
+async def delete_quiz_question(set_id: str, question_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    """Deletes an individual question from a quiz set and decrements question_count."""
+    try:
+        db.collection("quiz_questions").document(question_id).delete()
+        set_ref = db.collection("practice_quizzes").document(set_id)
+        set_doc = set_ref.get()
+        if set_doc.exists:
+            current = max(0, set_doc.to_dict().get("question_count", 1) - 1)
+            set_ref.update({"question_count": current})
+        return {"success": True, "question_id": question_id, "deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── Practice: Coding Exercises ───────────────────────────────────────────────
 
 @router.get("/practice/coding")
@@ -1528,6 +1555,21 @@ async def create_course(body: CourseCreate, admin_user: Dict[str, Any] = Depends
     except Exception:
         pass
     return {"success": True, "course": data}
+
+
+@router.delete("/courses/{course_id}")
+async def delete_course(course_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    """Deletes a course and flushes catalog cache."""
+    try:
+        db.collection("courses").document(course_id).delete()
+        try:
+            from app.routers.catalog import invalidate_catalog_cache
+            invalidate_catalog_cache()
+        except Exception:
+            pass
+        return {"success": True, "course_id": course_id, "deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 class LessonLinkCreate(BaseModel):

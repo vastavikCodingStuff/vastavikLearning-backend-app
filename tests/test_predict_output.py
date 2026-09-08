@@ -75,3 +75,81 @@ def test_admin_predict_output_crud():
     r_del = client.delete(f"/admin/practice/predict-output/{set_id}", headers=headers)
     assert r_del.status_code == 200
     assert r_del.json().get("deleted") is True
+
+
+def test_admin_course_and_practice_delete_endpoints():
+    """Verify delete endpoints for course, quiz set, quiz question, coding, mcq, pyq."""
+    admin_token = create_access_token({
+        "sub": "admin_test_uid",
+        "email": "admin@vastavik.com",
+        "is_admin": True,
+        "role": "admin",
+    })
+    headers = {"Authorization": f"Bearer {admin_token}"}
+
+    # 1. Course deletion
+    c_res = client.post("/admin/courses", json={"title": "Temporary Test Course", "description": "Temp"}, headers=headers)
+    assert c_res.status_code == 200
+    cid = c_res.json()["course"]["id"]
+    del_c = client.delete(f"/admin/courses/{cid}", headers=headers)
+    assert del_c.status_code == 200
+    assert del_c.json().get("deleted") is True
+
+    # 2. Quiz set & question deletion
+    qset_res = client.post("/admin/practice/quiz", json={"title": "Temp Quiz Set", "subject": "Java"}, headers=headers)
+    assert qset_res.status_code == 200
+    qset_id = qset_res.json()["id"]
+
+    qq_res = client.post(f"/admin/practice/quiz/{qset_id}/questions", json={
+        "question": "What is 2+2?", "options": ["3", "4", "5", "6"], "correct_index": 1, "explanation": "Math", "subject": "Java"
+    }, headers=headers)
+    assert qq_res.status_code == 200
+    qq_id = qq_res.json()["id"]
+
+    # Delete question
+    del_qq = client.delete(f"/admin/practice/quiz/{qset_id}/questions/{qq_id}", headers=headers)
+    assert del_qq.status_code == 200
+    assert del_qq.json().get("deleted") is True
+
+    # Delete quiz set
+    del_qset = client.delete(f"/admin/practice/quiz/{qset_id}", headers=headers)
+    assert del_qset.status_code == 200
+    assert del_qset.json().get("deleted") is True
+
+    # 3. Coding exercise deletion
+    cd_res = client.post("/admin/practice/coding", json={
+        "title": "Temp Coding Problem",
+        "description": "Desc",
+        "language": "java",
+        "starter_code": "class Solution {}",
+        "solution_code": "class Solution { int a = 1; }",
+        "test_cases": [{"input": "1", "expected": "1"}]
+    }, headers=headers)
+    assert cd_res.status_code == 200
+    cd_id = cd_res.json()["id"]
+    del_cd = client.delete(f"/admin/practice/coding/{cd_id}", headers=headers)
+    assert del_cd.status_code == 200
+
+    # 4. MCQ deletion
+    mcq_res = client.post("/admin/practice/mcq", json={
+        "question": "Temp MCQ?",
+        "options": ["A", "B", "C", "D"],
+        "correct_index": 0,
+        "explanation": "Because A",
+        "subject": "Java",
+        "topic": "Basics"
+    }, headers=headers)
+    assert mcq_res.status_code == 200
+    mcq_id = mcq_res.json()["id"]
+    del_mcq = client.delete(f"/admin/practice/mcq/{mcq_id}", headers=headers)
+    assert del_mcq.status_code == 200
+
+    # 5. PYQ deletion
+    pyq_res = client.post("/admin/practice/pyq", json={
+        "board": "ICSE", "year": "2024", "subject": "Java", "question": "Temp PYQ?", "solution": "Sol", "marks": 5
+    }, headers=headers)
+    assert pyq_res.status_code == 200
+    pyq_id = pyq_res.json()["id"]
+    del_pyq = client.delete(f"/admin/practice/pyq/{pyq_id}", headers=headers)
+    assert del_pyq.status_code == 200
+
