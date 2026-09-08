@@ -307,6 +307,27 @@ async def get_student(uid: str, admin_user: Dict[str, Any] = Depends(require_adm
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/students/{uid}")
+async def delete_student(uid: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    """Deletes a student and cascades to their selections, notes, chats, etc."""
+    try:
+        db.collection("users").document(uid).delete()
+        db.collection("studentSelections").document(uid).delete()
+        db.collection("refreshTokens").document(uid).delete()
+        for n in db.collection("notes").where("uid", "==", uid).stream():
+            n.reference.delete()
+        for t in db.collection("transactions").where("uid", "==", uid).stream():
+            t.reference.delete()
+        for c in db.collection("ai_chat_sessions").where("student_id", "==", uid).stream():
+            c.reference.delete()
+        for c in db.collection("ai_chat_sessions").where("uid", "==", uid).stream():
+            c.reference.delete()
+        return {"success": True, "uid": uid, "deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 # ─── AI Chat Sessions ─────────────────────────────────────────────────────────
 
 @router.get("/ai-chats")
