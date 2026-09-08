@@ -85,25 +85,28 @@ def test_referral_code_uniqueness():
 def test_referral_gated_before_payment():
     import asyncio
     uid = _uid()
-    db_user = gs._get_user(uid)
-    db_user["access_type"] = "free"
-    db_user["is_premium"] = False
-    res = asyncio.run(gs.ensure_referral_code(uid))
+    async def setup():
+        db_user = await gs._get_user(uid)
+        db_user["access_type"] = "free"
+        db_user["is_premium"] = False
+        return await gs.ensure_referral_code(uid)
+    res = asyncio.run(setup())
     assert res["eligible"] is False
     assert res["code"] is None
 
 
 def test_referral_full_flow():
     import asyncio
-    referrer = _uid()
-    referee = _uid()
-    r = gs._get_user(referrer)
-    r["access_type"] = "paid"
-    r["is_premium"] = True
-    rr = gs._get_user(referee)
-    rr["access_type"] = "free"
 
     async def run():
+        referrer = _uid()
+        referee = _uid()
+        r = await gs._get_user(referrer)
+        r["access_type"] = "paid"
+        r["is_premium"] = True
+        rr = await gs._get_user(referee)
+        rr["access_type"] = "free"
+
         code_info = await gs.ensure_referral_code(referrer)
         assert code_info["eligible"] is True
         code = code_info["code"]
@@ -122,7 +125,7 @@ def test_referral_full_flow():
 
         stat = await gs.get_referral_status(referrer)
         assert stat["rewarded_count"] == 1
-        assert gs.credit_balance_of(referrer) == REFERRAL_REWARD_INR
+        assert await gs.credit_balance_of(referrer) == REFERRAL_REWARD_INR
 
         result2 = await gs.award_referral_and_share_rewards(referee, order_id)
         assert result2["referral_awarded"] is False
@@ -135,21 +138,21 @@ def test_referral_cap_three():
 
     async def run():
         referrer = _uid()
-        r = gs._get_user(referrer)
+        r = await gs._get_user(referrer)
         r["access_type"] = "paid"
         r["is_premium"] = True
         code = (await gs.ensure_referral_code(referrer))["code"]
 
         for i in range(3):
             referee = _uid()
-            rr = gs._get_user(referee)
+            rr = await gs._get_user(referee)
             rr["access_type"] = "paid"
             rr["is_premium"] = True
             await gs.attribute_referral_on_signup(referee, code, device_id=f"dev_{i}")
             await gs.award_referral_and_share_rewards(referee, f"order_{i}")
 
         fourth_referee = _uid()
-        rr4 = gs._get_user(fourth_referee)
+        rr4 = await gs._get_user(fourth_referee)
         rr4["access_type"] = "paid"
         rr4["is_premium"] = True
         await gs.attribute_referral_on_signup(fourth_referee, code, device_id="dev_4")
@@ -159,7 +162,7 @@ def test_referral_cap_three():
         stat = await gs.get_referral_status(referrer)
         assert stat["rewarded_count"] == 3
         assert stat["remaining_count"] == 0
-        assert gs.credit_balance_of(referrer) == 3 * REFERRAL_REWARD_INR
+        assert await gs.credit_balance_of(referrer) == 3 * REFERRAL_REWARD_INR
 
     asyncio.run(run())
 
@@ -169,7 +172,7 @@ def test_share_full_flow():
 
     async def run():
         sharer = _uid()
-        s = gs._get_user(sharer)
+        s = await gs._get_user(sharer)
         s["access_type"] = "paid"
         s["is_premium"] = True
         link = await gs.create_share_token(sharer)
@@ -180,13 +183,13 @@ def test_share_full_flow():
         await gs.track_share_click(token, ua="Mozilla/5.0")
 
         referee = _uid()
-        rr = gs._get_user(referee)
+        rr = await gs._get_user(referee)
         rr["access_type"] = "paid"
         rr["is_premium"] = True
         await gs.attribute_share_on_signup(referee, token)
         result = await gs.convert_share_if_eligible(referee)
         assert result["converted"] is True
-        assert gs.credit_balance_of(sharer) == SHARE_REWARD_INR
+        assert await gs.credit_balance_of(sharer) == SHARE_REWARD_INR
 
     asyncio.run(run())
 
@@ -196,7 +199,7 @@ def test_share_cap_two():
 
     async def run():
         sharer = _uid()
-        s = gs._get_user(sharer)
+        s = await gs._get_user(sharer)
         s["access_type"] = "paid"
         s["is_premium"] = True
         tokens = []
@@ -206,7 +209,7 @@ def test_share_cap_two():
 
         for idx, t in enumerate(tokens[:2]):
             ref = _uid()
-            rr = gs._get_user(ref)
+            rr = await gs._get_user(ref)
             rr["access_type"] = "paid"
             rr["is_premium"] = True
             await gs.attribute_share_on_signup(ref, t)
@@ -214,13 +217,13 @@ def test_share_cap_two():
             assert r["converted"] is True, r
 
         ref3 = _uid()
-        rr3 = gs._get_user(ref3)
+        rr3 = await gs._get_user(ref3)
         rr3["access_type"] = "paid"
         rr3["is_premium"] = True
         await gs.attribute_share_on_signup(ref3, tokens[2])
         r = await gs.convert_share_if_eligible(ref3)
         assert r["converted"] is False
-        assert gs.credit_balance_of(sharer) == 2 * SHARE_REWARD_INR
+        assert await gs.credit_balance_of(sharer) == 2 * SHARE_REWARD_INR
 
     asyncio.run(run())
 
@@ -233,13 +236,13 @@ def test_coupon_redemption_marks_offline_comp():
         await gs.set_active_coupon("VASTAVIKOFFLINE2025", admin)
 
         student = _uid()
-        st = gs._get_user(student)
+        st = await gs._get_user(student)
         st["access_type"] = "free"
         st["is_premium"] = False
 
         result = await gs.redeem_coupon(student, "vastavikoffline2025")
         assert result["success"] is True
-        st = gs._get_user(student)
+        st = await gs._get_user(student)
         assert st["access_type"] == "offline-comp"
         assert st["is_premium"] is True
 
@@ -251,7 +254,8 @@ def test_coupon_invalid():
 
     async def run():
         student = _uid()
-        gs._get_user(student)["access_type"] = "free"
+        u = await gs._get_user(student)
+        u["access_type"] = "free"
         result = await gs.redeem_coupon(student, "WRONGCODE")
         assert result["success"] is False
 
@@ -261,7 +265,10 @@ def test_coupon_invalid():
 def test_pricing_quote_endpoint():
     import asyncio
     uid = _uid()
-    gs._get_user(uid)["credit_balance"] = 50.0
+    async def setup():
+        u = await gs._get_user(uid)
+        u["credit_balance"] = 50.0
+    asyncio.run(setup())
     token = auth(uid)
     h = hm("/api/v1/pricing/quote", "GET")
     h["Authorization"] = f"Bearer {token}"

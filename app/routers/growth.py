@@ -61,14 +61,14 @@ async def redeem_coupon(payload: Dict[str, str], current_user: Dict[str, Any] = 
 
 @router.get("/pricing/quote")
 async def pricing_quote(current_user: Dict[str, Any] = Depends(get_current_user)):
-    return gs.user_quote(current_user.get("sub"))
+    return await gs.user_quote(current_user.get("sub"))
 
 
 @router.get("/credits/balance")
 async def credits_balance(current_user: Dict[str, Any] = Depends(get_current_user)):
     uid = current_user.get("sub")
     return {
-        "credit_balance_inr": gs.credit_balance_of(uid),
+        "credit_balance_inr": await gs.credit_balance_of(uid),
         "ledger": await gs.credits_ledger(uid),
     }
 

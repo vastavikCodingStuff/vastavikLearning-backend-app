@@ -28,29 +28,31 @@ async def create_payment_order(
     access_type = user.get("access_type", "free")
 
     if access_type == "offline-comp":
+        quote = await gs.user_quote(uid)
         return {
             "order_id": f"order_offline_{uuid.uuid4().hex[:10]}",
             "amount_paise": 0,
             "currency": "INR",
             "razorpay_order_id": None,
             "skip_payment": True,
-            "quote": gs.user_quote(uid),
+            "quote": quote,
         }
 
     coupon_code = request_body.get("coupon_code", "").strip()
     if coupon_code:
         result = await gs.redeem_coupon(uid, coupon_code)
         if result.get("success"):
+            quote = await gs.user_quote(uid)
             return {
                 "order_id": f"order_coupon_{uuid.uuid4().hex[:10]}",
                 "amount_paise": 0,
                 "currency": "INR",
                 "razorpay_order_id": None,
                 "skip_payment": True,
-                "quote": gs.user_quote(uid),
+                "quote": quote,
             }
 
-    quote = gs.user_quote(uid)
+    quote = await gs.user_quote(uid)
     amount_paise = quote["total_amount_paise"]
 
     if amount_paise <= 0:

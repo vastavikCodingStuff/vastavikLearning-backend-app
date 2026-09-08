@@ -144,6 +144,7 @@ app.include_router(admin.router, prefix="/api/v1")
 app.include_router(admin_dashboard.router, prefix="/api/v1")
 app.include_router(activity.router)
 app.include_router(growth.router)
+app.include_router(growth.admin_router)
 app.include_router(growth.admin_router, prefix="/api/v1")
 
 # Enable Gzip compression (minimum 1KB) for fast network transfer & low bandwidth usage
