@@ -16,13 +16,48 @@ _firebase_initialized = False
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
+    import base64
 
     cred = None
-    if settings.FIREBASE_CREDENTIALS_JSON:
-        cred_dict = json.loads(settings.FIREBASE_CREDENTIALS_JSON)
-        cred = credentials.Certificate(cred_dict)
-    elif settings.FIREBASE_CREDENTIALS_PATH and os.path.exists(settings.FIREBASE_CREDENTIALS_PATH):
-        cred = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
+    # 1. Base64-encoded credentials (ideal for Render environment variable)
+    b64_creds = getattr(settings, "FIREBASE_CREDENTIALS_BASE64", None) or os.environ.get("FIREBASE_CREDENTIALS_BASE64")
+    if b64_creds:
+        try:
+            decoded = base64.b64decode(b64_creds).decode("utf-8")
+            cred_dict = json.loads(decoded)
+            cred = credentials.Certificate(cred_dict)
+            logger.info("Loaded Firebase credentials from FIREBASE_CREDENTIALS_BASE64.")
+        except Exception as e:
+            logger.warning(f"Failed decoding FIREBASE_CREDENTIALS_BASE64: {e}")
+
+    # 2. JSON string credentials
+    if not cred:
+        json_creds = getattr(settings, "FIREBASE_CREDENTIALS_JSON", None) or os.environ.get("FIREBASE_CREDENTIALS_JSON")
+        if json_creds:
+            try:
+                cred_dict = json.loads(json_creds)
+                cred = credentials.Certificate(cred_dict)
+                logger.info("Loaded Firebase credentials from FIREBASE_CREDENTIALS_JSON.")
+            except Exception as e:
+                logger.warning(f"Failed parsing FIREBASE_CREDENTIALS_JSON: {e}")
+
+    # 3. Render Secret File or standard paths
+    if not cred:
+        candidate_paths = [
+            "/etc/secrets/serviceAccountKey.json",
+            "/etc/secrets/service_account.json",
+            getattr(settings, "FIREBASE_CREDENTIALS_PATH", None),
+            "serviceAccountKey.json",
+            os.path.join(os.path.dirname(__file__), "..", "..", "serviceAccountKey.json"),
+        ]
+        for p in candidate_paths:
+            if p and os.path.exists(p):
+                try:
+                    cred = credentials.Certificate(p)
+                    logger.info(f"Loaded Firebase credentials from file: {p}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed loading credentials from {p}: {e}")
 
     if cred:
         # Use existing default app if already initialized
@@ -31,6 +66,8 @@ try:
         _firestore_client = firestore.client()
         _firebase_initialized = True
         logger.info(f"Firebase Firestore connected successfully to project '{settings.FIREBASE_PROJECT_ID}'.")
+    else:
+        logger.warning("No Firebase credentials found. Running in in-memory mode.")
 except Exception as e:
     logger.warning(f"Could not initialize Firebase Firestore: {e}. Falling back to in-memory store.")
 
@@ -433,6 +470,24 @@ class DatabaseRepository:
         return self._curriculums.get(course_id, [])
 
     async def get_lesson(self, lesson_id: str) -> Optional[Dict[str, Any]]:
+        if self.use_live_firestore and _firestore_client is not None:
+            try:
+                # 1. Check flat videos collection (admin uploads)
+                v_doc = _firestore_client.collection("videos").document(lesson_id).get()
+                if v_doc.exists:
+                    d = v_doc.to_dict()
+                    d["id"] = v_doc.id
+                    return d
+
+                # 2. Check nested curriculum lessons across all courses/parts/subparts
+                for l_doc in _firestore_client.collection_group("lessons").stream():
+                    d = l_doc.to_dict()
+                    if l_doc.id == lesson_id or d.get("id") == lesson_id:
+                        d["id"] = l_doc.id
+                        return d
+            except Exception as e:
+                logger.warning(f"Error querying live lesson '{lesson_id}' from Firestore: {e}")
+
         return self._lessons.get(lesson_id)
 
     async def mark_visited(self, uid: str, course_id: str, part_id: str) -> bool:

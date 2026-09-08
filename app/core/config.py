@@ -45,14 +45,15 @@ class Settings(BaseSettings):
     JUDGE0_AUTH_TOKEN: Optional[str] = None
 
     # AI API Keys
-    MISTRAL_API_KEY: Optional[str] = None
+    MISTRAL_API_KEY: Optional[str] = "WKifALNZPu4xSxRDeNu0vVumvbjvqao1"
     GEMINI_API_KEY: Optional[str] = None
-    XKIRO_API_KEY: Optional[str] = None
+    XKIRO_API_KEY: Optional[str] = "sk-xt-075d80d397e9a363d923b80bd53d65c01463b37b28f60dae"
     XKIRO_BASE_URL: str = "https://api.xkiro.com/v1"
 
     # Firebase
     FIREBASE_CREDENTIALS_PATH: Optional[str] = "serviceAccountKey.json"
     FIREBASE_CREDENTIALS_JSON: Optional[str] = None
+    FIREBASE_CREDENTIALS_BASE64: Optional[str] = None
     FIREBASE_PROJECT_ID: str = "vastavikcomputers"
 
     # OAuth

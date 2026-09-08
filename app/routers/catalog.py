@@ -23,6 +23,13 @@ _catalog_cache_timestamp: float = 0.0
 CATALOG_CACHE_TTL_SECONDS = 300.0  # 5 minutes
 
 
+def invalidate_catalog_cache():
+    """Invalidate cached home catalog so newly created/modified courses appear immediately."""
+    global _catalog_cache, _catalog_cache_timestamp
+    _catalog_cache = None
+    _catalog_cache_timestamp = 0.0
+
+
 @router.get("/catalog/home", response_model=HomeCatalogResponse, dependencies=[Depends(rate_limit("general"))])
 async def get_home_catalog():
     """

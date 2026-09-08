@@ -725,69 +725,83 @@ async def _call_ai_parser(prompt: str, model: str) -> str:
     from app.core.config import settings
     import httpx
 
-    # 1. XKIRO – OpenAI compatible, base_url must end with /v1 per docs https://docs.xkiro.com/guides/sdk-openai/
-    # Default free model per user request: minimax/minimax-m2:free
-    if settings.XKIRO_API_KEY:
-        # Use minimax free model if caller didn't specify a concrete openai/xxx model
-        xkiro_model = model if ("/" in (model or "") or model == "openai/gpt-5.6-sol") else "minimax/minimax-m2:free"
-        # If user explicitly passes generic "mistral" etc, map to minimax free
-        if model in ("mistral", "xkiro", None, ""):
-            xkiro_model = "minimax/minimax-m2:free"
-        base = (settings.XKIRO_BASE_URL or "https://api.xkiro.com/v1").rstrip("/")
-        # Ensure /v1 suffix per XKIRO docs – SDK appends /chat/completions
-        if not base.endswith("/v1"):
-            base = base + "/v1"
-        url = f"{base}/chat/completions"
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {settings.XKIRO_API_KEY}"},
-                json={
-                    "model": xkiro_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 4000,
-                },
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+    last_error = None
 
-    if model == "gemini" and settings.GEMINI_API_KEY:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}"
-        )
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(
-                url,
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000},
-                },
+    # 1. XKIRO – OpenAI compatible, default free model: minimax/minimax-m2:free
+    if settings.XKIRO_API_KEY:
+        try:
+            xkiro_model = model if ("/" in (model or "") or model == "openai/gpt-5.6-sol") else "minimax/minimax-m2:free"
+            if model in ("mistral", "xkiro", None, ""):
+                xkiro_model = "minimax/minimax-m2:free"
+            base = (settings.XKIRO_BASE_URL or "https://api.xkiro.com/v1").rstrip("/")
+            if not base.endswith("/v1"):
+                base = base + "/v1"
+            url = f"{base}/chat/completions"
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                r = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {settings.XKIRO_API_KEY}"},
+                    json={
+                        "model": xkiro_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 4000,
+                    },
+                )
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.warning(f"XKIRO parser call failed: {e}. Trying fallback providers...")
+            last_error = f"XKIRO: {e}"
+
+    if (model == "gemini" or not settings.XKIRO_API_KEY) and settings.GEMINI_API_KEY:
+        try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}"
             )
-            r.raise_for_status()
-            data = r.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(
+                    url,
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000},
+                    },
+                )
+                r.raise_for_status()
+                data = r.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as e:
+            logger.warning(f"Gemini parser call failed: {e}")
+            last_error = f"Gemini: {e}"
 
     if settings.MISTRAL_API_KEY:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(
-                "https://api.mistral.ai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {settings.MISTRAL_API_KEY}"},
-                json={
-                    "model": "mistral-large-latest",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 4000,
-                },
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+        for m_name in ["mistral-small-latest", "mistral-large-latest", "open-mistral-7b"]:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    r = await client.post(
+                        "https://api.mistral.ai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {settings.MISTRAL_API_KEY}"},
+                        json={
+                            "model": m_name,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1,
+                            "max_tokens": 4000,
+                        },
+                    )
+                    r.raise_for_status()
+                    return r.json()["choices"][0]["message"]["content"]
+            except Exception as e:
+                last_error = f"Mistral ({m_name}): {e}"
+                continue
+
+    if last_error:
+        raise HTTPException(status_code=502, detail=f"All configured AI providers failed. Last error: {last_error}")
 
     raise HTTPException(
         status_code=503,
         detail=(
-            "No AI model configured. Set XKIRO_API_KEY (recommended, uses minimax/minimax-m2:free) or MISTRAL_API_KEY/GEMINI_API_KEY in backend env to enable ingest. Docs: https://docs.xkiro.com/guides/sdk-openai/"
+            "No AI model configured. Set XKIRO_API_KEY (recommended, uses minimax/minimax-m2:free) or MISTRAL_API_KEY/GEMINI_API_KEY in backend env to enable ingest."
         ),
     )
 
@@ -1335,6 +1349,28 @@ async def delete_video(video_id: str, admin_user: Dict[str, Any] = Depends(requi
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/courses")
+async def list_admin_courses(admin_user: Dict[str, Any] = Depends(require_admin_user)):
+    """Lists all courses for admin curriculum overview."""
+    courses = []
+    try:
+        for doc in db.collection("courses").stream():
+            d = doc.to_dict()
+            courses.append({
+                "id": doc.id,
+                "title": d.get("title", "Untitled Course"),
+                "description": d.get("description", ""),
+                "icon_name": d.get("iconName") or d.get("icon_name", "code"),
+                "color": int(d.get("color", 0xFFE65100)),
+                "order": int(d.get("order", 1)),
+                "is_published": d.get("is_published", True),
+            })
+        courses.sort(key=lambda x: x["order"])
+    except Exception as e:
+        logger.warning(f"Error fetching admin courses: {e}")
+    return {"courses": courses}
+
+
 @router.post("/courses")
 async def create_course(body: CourseCreate, admin_user: Dict[str, Any] = Depends(require_admin_user)):
     """Creates a new course track."""
@@ -1345,6 +1381,12 @@ async def create_course(body: CourseCreate, admin_user: Dict[str, Any] = Depends
     }
     try:
         db.collection("courses").document(cid).set(data)
+    except Exception:
+        pass
+    # Invalidate public catalog cache so it reflects immediately in Android app and web
+    try:
+        from app.routers.catalog import invalidate_catalog_cache
+        invalidate_catalog_cache()
     except Exception:
         pass
     return {"success": True, "course": data}
