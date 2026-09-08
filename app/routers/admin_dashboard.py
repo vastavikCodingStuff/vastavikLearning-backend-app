@@ -20,26 +20,85 @@ router = APIRouter(prefix="/admin", tags=["Admin Dashboard — Extended"])
 
 # ─── Response normalization helpers ───────────────────────────────────────────
 
-def _normalize_student(doc_data: Dict[str, Any], doc_id: str) -> Dict[str, Any]:
+def _normalize_student(doc_data: Dict[str, Any], doc_id: str, selection_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Map a raw Firestore user document onto the StudentProfile contract consumed by
     the Next.js admin frontend (see types/api.ts → StudentProfile).
-
-    Firestore stores `total_lessons_completed` and `student_class`; the frontend
-    expects `lessons_completed` and `class_grade`. The doc id is also exposed
-    as `uid` so it survives even if the doc field is missing.
+    Supports camelCase and snake_case, joins studentSelections for enrolled course,
+    and calculates completed lessons.
     """
     normalized: Dict[str, Any] = dict(doc_data)
-    normalized.setdefault("uid", doc_id)
-    if "total_lessons_completed" in normalized and "lessons_completed" not in normalized:
-        normalized["lessons_completed"] = normalized["total_lessons_completed"]
-    if "student_class" in normalized and "class_grade" not in normalized:
-        normalized["class_grade"] = normalized["student_class"]
-    normalized.setdefault("lessons_completed", 0)
-    normalized.setdefault("streak_count", 0)
-    normalized.setdefault("is_premium", False)
+    normalized["uid"] = normalized.get("uid") or doc_id
+
+    # Name
+    name = normalized.get("name") or normalized.get("displayName") or "Student"
+    normalized["name"] = name
+
+    # Email
+    email = normalized.get("email")
+    if not email:
+        phone = normalized.get("phone") or normalized.get("phoneNumber")
+        if phone:
+            email = f"{phone}@student.vastavik"
+        else:
+            email = f"student_{doc_id[:8]}@vastavik.com"
+    normalized["email"] = email
+
+    # Preferred language
+    pref_lang = normalized.get("preferred_language") or normalized.get("preferredLanguage") or "Java"
+    normalized["preferred_language"] = pref_lang
+
+    # Board
+    board = normalized.get("board") or "ICSE"
+    normalized["board"] = board
+
+    # Class / Grade
+    student_class = normalized.get("student_class") or normalized.get("studentClass") or normalized.get("class_grade") or ""
+    normalized["student_class"] = student_class
+    normalized["class_grade"] = student_class
+
+    # School
+    school = normalized.get("school") or ""
+    normalized["school"] = school
+
+    # Date of birth
+    dob = normalized.get("dob") or normalized.get("dateOfBirth") or normalized.get("date_of_birth") or ""
+    normalized["dob"] = dob
+    normalized["date_of_birth"] = dob
+
+    # Premium status
+    is_prem = normalized.get("is_premium") if "is_premium" in normalized else normalized.get("isPremium", False)
+    normalized["is_premium"] = bool(is_prem)
+
+    # Enrollment data from studentSelections
+    enrolled_course_name = None
+    enrolled_course_id = None
+    visited_parts: List[Any] = []
+    if selection_data:
+        enrolled_course_name = selection_data.get("courseName") or selection_data.get("course_name")
+        enrolled_course_id = selection_data.get("courseId") or selection_data.get("course_id")
+        visited_parts = selection_data.get("visitedParts") or []
+
+    normalized["enrolled_course"] = enrolled_course_name
+    normalized["enrolled_course_id"] = enrolled_course_id
+
+    # Lessons completed
+    existing_completed = normalized.get("lessons_completed") or normalized.get("total_lessons_completed") or 0
+    normalized["lessons_completed"] = max(int(existing_completed), len(visited_parts))
+    normalized["streak_count"] = int(normalized.get("streak_count", 0))
+
+    # Created At
+    created_at = normalized.get("created_at") or normalized.get("createdAt")
+    if hasattr(created_at, "isoformat"):
+        created_at = created_at.isoformat()
+    elif not created_at:
+        created_at = datetime.now(timezone.utc).isoformat()
+    normalized["created_at"] = str(created_at)
+
     normalized.setdefault("subscription_expires_at", None)
     normalized.setdefault("payment_details", [])
+    normalized.setdefault("role", "student")
+
     return normalized
 
 
@@ -89,7 +148,12 @@ async def get_dashboard_stats(
     try:
         users_ref = db.collection("users")
         users = list(users_ref.stream())
-        students = [u for u in users if u.to_dict().get("role") == "student"]
+        students = [
+            u for u in users
+            if u.to_dict().get("role") == "student"
+            or u.to_dict().get("studentClass")
+            or u.to_dict().get("board")
+        ]
 
         courses_ref = db.collection("courses")
         courses = list(courses_ref.stream())
@@ -105,7 +169,8 @@ async def get_dashboard_stats(
 
         lang_dist: Dict[str, int] = {}
         for s in students:
-            lang = s.to_dict().get("preferred_language", "Java")
+            d = s.to_dict()
+            lang = d.get("preferred_language") or d.get("preferredLanguage") or "Java"
             lang_dist[lang] = lang_dist.get(lang, 0) + 1
 
         return {
@@ -135,16 +200,72 @@ async def list_students(
 ):
     """List all students with optional name/email search and pagination."""
     try:
-        ref = db.collection("users").where("role", "==", "student")
-        docs = [_normalize_student(d.to_dict(), d.id) for d in ref.stream()]
+        # 1. Fetch studentSelections mapping for fast lookup
+        selections: Dict[str, Dict[str, Any]] = {
+            d.id: d.to_dict() for d in db.collection("studentSelections").stream()
+        }
 
+        # 2. Fetch all users from Firestore
+        users_stream = db.collection("users").stream()
+        students: List[Dict[str, Any]] = []
+
+        for d in users_stream:
+            data = d.to_dict()
+            # Exclude admin accounts
+            if data.get("role") == "admin" or data.get("email") == "admin@vastaviklearning.com":
+                continue
+
+            # Include if explicitly role=='student', or has selection, or has student profile attributes,
+            # or role is None.
+            role = data.get("role")
+            is_student = (
+                role == "student"
+                or d.id in selections
+                or bool(data.get("board") or data.get("studentClass") or data.get("school"))
+                or role is None
+            )
+
+            # Skip empty placeholder docs created by tests that have no name, no email, no board, no role
+            if not is_student or (not data.get("name") and not data.get("email") and d.id not in selections):
+                continue
+
+            sel_data = selections.get(d.id)
+            normalized = _normalize_student(data, d.id, sel_data)
+            students.append(normalized)
+
+        # Also check if any uid in selections wasn't in users collection
+        existing_uids = {s["uid"] for s in students}
+        for sel_uid, sel_data in selections.items():
+            if sel_uid not in existing_uids and not sel_uid.startswith("student_test"):
+                students.append(_normalize_student({}, sel_uid, sel_data))
+
+        # 3. Priority sort:
+        # Prioritize real enrolled students (those in studentSelections) first,
+        # then named students with real names, then most recently created.
+        def sort_key(s: Dict[str, Any]):
+            has_enrollment = 1 if s.get("enrolled_course") else 0
+            name = s.get("name", "")
+            is_real_name = 1 if name not in ["Student", "Onboarding Student"] and not s.get("email", "").startswith("student_1") else 0
+            has_school = 1 if s.get("school") else 0
+            return (has_enrollment, is_real_name, has_school, s.get("created_at", ""))
+
+        students.sort(key=sort_key, reverse=True)
+
+        # 4. Search filter
         if search:
             q = search.lower()
-            docs = [d for d in docs if q in d.get("name", "").lower() or q in d.get("email", "").lower()]
+            students = [
+                s for s in students
+                if q in s.get("name", "").lower()
+                or q in s.get("email", "").lower()
+                or q in s.get("school", "").lower()
+                or q in s.get("board", "").lower()
+                or q in (s.get("enrolled_course") or "").lower()
+            ]
 
-        total = len(docs)
+        total = len(students)
         start = (page - 1) * page_size
-        paginated = docs[start: start + page_size]
+        paginated = students[start: start + page_size]
 
         return {
             "items": paginated,
@@ -162,9 +283,16 @@ async def get_student(uid: str, admin_user: Dict[str, Any] = Depends(require_adm
     """Full student profile + payment history."""
     try:
         doc = db.collection("users").document(uid).get()
-        if not doc.exists:
+        user_data = doc.to_dict() if doc.exists else {}
+
+        # Fetch studentSelections for this uid
+        sel_doc = db.collection("studentSelections").document(uid).get()
+        sel_data = sel_doc.to_dict() if sel_doc.exists else None
+
+        if not doc.exists and not sel_doc.exists:
             raise HTTPException(status_code=404, detail="Student not found")
-        student = _normalize_student(doc.to_dict(), doc.id)
+
+        student = _normalize_student(user_data, uid, sel_data)
 
         # Fetch payment history
         txns = db.collection("transactions").where("uid", "==", uid).stream()
@@ -317,17 +445,23 @@ async def _compute_course_completion(course_id: str, course_title: str) -> Dict[
     parts = await db.get_course_curriculum(course_id)
     total_parts = len(parts)
 
-    user_docs = db.collection("users").where("role", "==", "student").stream()
+    selections = list(db.collection("studentSelections").stream())
     per_student_percent: List[float] = []
-    for u_doc in user_docs:
-        visited = await db.get_visited_parts(u_doc.id)
+
+    for s_doc in selections:
+        s_data = s_doc.to_dict()
+        cid = s_data.get("courseId") or s_data.get("course_id")
+        visited = s_data.get("visitedParts") or []
         prefix = f"{course_id}::"
-        completed = sum(1 for v in visited if isinstance(v, str) and v.startswith(prefix))
-        if completed == 0 and total_parts > 0:
-            continue
-        if total_parts == 0:
-            continue
-        per_student_percent.append(round((completed / total_parts) * 100.0, 1))
+        curriculum_part_ids = {p["part_id"] for p in parts} if parts else set()
+        completed = sum(1 for v in visited if isinstance(v, str) and (v.startswith(prefix) or v in curriculum_part_ids))
+
+        if cid == course_id or completed > 0:
+            if total_parts > 0:
+                pct = min(100.0, round((completed / total_parts) * 100.0, 1))
+            else:
+                pct = 0.0
+            per_student_percent.append(pct)
 
     enrolled = len(per_student_percent)
     avg = round(sum(per_student_percent) / enrolled, 1) if enrolled else 0.0
@@ -366,41 +500,36 @@ async def get_top_students(
     """
     try:
         courses = {d.id: d.to_dict().get("title", d.id) for d in db.collection("courses").stream()}
+        selections = {d.id: d.to_dict() for d in db.collection("studentSelections").stream()}
+        users = {d.id: d.to_dict() for d in db.collection("users").stream()}
 
-        user_docs = db.collection("users").where("role", "==", "student").stream()
         rows: List[Dict[str, Any]] = []
-        for u_doc in user_docs:
-            uid = u_doc.id
-            user = u_doc.to_dict()
-            visited = await db.get_visited_parts(uid)
-            if not visited:
+        for uid, s_data in selections.items():
+            if uid.startswith("student_test"):
                 continue
-            by_course: Dict[str, int] = {}
-            for v in visited:
-                if not isinstance(v, str) or "::" not in v:
-                    continue
-                cid, _ = v.split("::", 1)
-                by_course[cid] = by_course.get(cid, 0) + 1
+            cid = s_data.get("courseId") or s_data.get("course_id")
+            visited = s_data.get("visitedParts") or []
+            u_data = users.get(uid, {})
+            name = u_data.get("name") or u_data.get("displayName") or "Student"
 
-            best_course_id = max(by_course, key=by_course.get) if by_course else None
-            if not best_course_id:
-                continue
-            parts = await db.get_course_curriculum(best_course_id)
-            total_parts = len(parts)
-            completed_parts = by_course[best_course_id]
-            percent = round((completed_parts / total_parts) * 100.0, 1) if total_parts else 0.0
+            course_title = courses.get(cid, s_data.get("courseName") or "Enrolled Course")
+            parts = await db.get_course_curriculum(cid) if cid else []
+            total_parts = len(parts) if parts else (len(visited) or 1)
+            completed_parts = len(visited)
+            percent = min(100.0, round((completed_parts / total_parts) * 100.0, 1)) if total_parts else 0.0
+
             rows.append({
                 "uid": uid,
-                "student_name": user.get("name", "Student"),
-                "course_id": best_course_id,
-                "course_title": courses.get(best_course_id, best_course_id),
+                "student_name": name,
+                "course_id": cid or "",
+                "course_title": course_title,
                 "total_parts": total_parts,
                 "completed_parts": completed_parts,
                 "completion_percent": percent,
-                "last_activity": user.get("updated_at") or user.get("created_at") or "",
+                "last_activity": u_data.get("updated_at") or u_data.get("createdAt") or u_data.get("created_at") or "",
             })
 
-        rows.sort(key=lambda r: r["completion_percent"], reverse=True)
+        rows.sort(key=lambda r: (r["completion_percent"], r["completed_parts"]), reverse=True)
         return {"stats": rows[:limit]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
