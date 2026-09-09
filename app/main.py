@@ -92,12 +92,6 @@ from starlette.middleware.gzip import GZipMiddleware
 SERVER_START_TIME = time.time()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Setup upload directory
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    yield
-    # Teardown / cleanup if needed
 
 
 app = FastAPI(

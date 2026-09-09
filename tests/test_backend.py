@@ -19,6 +19,13 @@ from app.core.rate_limiter import limiter
 client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    limiter._buckets.clear()
+    yield
+    limiter._buckets.clear()
+
+
 def get_hmac_headers(path: str, method: str = "GET") -> dict:
     """Helper to generate valid HMAC request headers."""
     ts = str(time.time())
