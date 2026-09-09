@@ -31,7 +31,13 @@ async def submit_doubt(
 
     if file:
         os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-        file_ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
+        file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ".jpg"
+        allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported file format '{file_ext}'. Allowed attachments: JPEG, PNG, WEBP, PDF."
+            )
         file_name = f"doubt_{uuid.uuid4().hex[:10]}{file_ext}"
         file_path = os.path.join(settings.UPLOAD_DIR, file_name)
 

@@ -614,5 +614,25 @@ def test_anti_cold_start_keep_alive_config_and_health():
     assert "uptime_seconds" in data
 
 
+def test_upload_file_extension_validation():
+    """Verify that dangerous file types (.html, .svg, .js) are rejected on uploads."""
+    token = create_access_token({"sub": "student_test_upload", "role": "student"})
+    h = get_hmac_headers("/api/v1/doubts/submit", "POST")
+    h["Authorization"] = f"Bearer {token}"
+
+    # Try uploading malicious HTML file (XSS attack vector)
+    html_file = {"file": ("malicious.html", b"<script>alert('xss')</script>", "text/html")}
+    data = {"title": "XSS Test", "question": "Testing security", "subject": "Computer Science"}
+    res = client.post("/api/v1/doubts/submit", headers=h, data=data, files=html_file)
+    assert res.status_code == 400
+    assert "Unsupported file format" in res.json()["detail"]
+
+    # Try uploading safe image file
+    safe_file = {"file": ("screenshot.png", b"\x89PNG\r\n\x1a\nfakeimage", "image/png")}
+    res_safe = client.post("/api/v1/doubts/submit", headers=h, data=data, files=safe_file)
+    assert res_safe.status_code in (200, 201)
+
+
+
 
 

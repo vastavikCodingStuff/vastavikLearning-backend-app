@@ -37,8 +37,14 @@ async def report_bug(
 
     if media:
         os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+        allowed_bug_extensions = {".jpg", ".jpeg", ".png", ".webp", ".pdf", ".txt", ".log"}
         for upload in media:
-            ext = os.path.splitext(upload.filename)[1] if upload.filename else ".dat"
+            ext = os.path.splitext(upload.filename)[1].lower() if upload.filename else ".log"
+            if ext not in allowed_bug_extensions:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Unsupported attachment format '{ext}'. Allowed: JPEG, PNG, WEBP, PDF, TXT, LOG."
+                )
             filename = f"bug_{uuid.uuid4().hex[:8]}{ext}"
             file_path = os.path.join(settings.UPLOAD_DIR, filename)
             content = await upload.read()
