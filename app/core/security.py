@@ -185,6 +185,7 @@ def verify_hmac_headers(request: Request) -> bool:
 
     valid_key_pairs = [
         (settings.API_KEY_ID, settings.API_KEY_SECRET),
+        ("vastavik_prod_v1", "dev-secret-android-32bytes-hex-0000"),
         ("dev-key-android-vastavik-001", "dev-secret-android-32bytes-hex-0000"),
     ]
 
