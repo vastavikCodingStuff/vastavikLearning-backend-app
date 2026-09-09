@@ -85,6 +85,20 @@ async def get_lesson(lesson_id: str, current_user: Optional[Dict[str, Any]] = De
                 detail="This lesson is part of Vastavik Pro. Please upgrade to unlock.",
             )
 
+    # Normalize camelCase to snake_case if fetched from legacy or direct Firestore
+    if "youtube_url" not in lesson and "youtubeUrl" in lesson:
+        lesson["youtube_url"] = lesson["youtubeUrl"]
+    if "youtube_video_id" not in lesson and "youtubeVideoId" in lesson:
+        lesson["youtube_video_id"] = lesson["youtubeVideoId"]
+    if "whiteboard_image_url" not in lesson:
+        lesson["whiteboard_image_url"] = lesson.get("whiteboardImageUrl", "")
+    if "code_sample" not in lesson:
+        lesson["code_sample"] = lesson.get("codeSample", "")
+    if "duration_sec" not in lesson:
+        lesson["duration_sec"] = lesson.get("durationSec", 0)
+    if "description" not in lesson or lesson["description"] is None:
+        lesson["description"] = ""
+
     # Normalize format for Android client (vscode -> screen_recording)
     fmt = lesson.get("video_format") or lesson.get("videoFormat") or "screen_recording"
     if fmt == "vscode":
