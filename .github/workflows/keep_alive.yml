@@ -1,0 +1,28 @@
+﻿name: Render Backend 24/7 Keep-Alive
+
+on:
+  schedule:
+    # Run every 10 minutes (Render spins down free tier after 15 minutes of inactivity)
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: render-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping-render:
+    name: Ping Render Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping Render Backend Health Endpoint
+        run: |
+          echo "Sending keep-alive ping to Render backend..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://vastaviklearning-backend-app.onrender.com/health)
+          echo "Render HTTP Status: $RESPONSE"
+          if [ "$RESPONSE" -ge 200 ] && [ "$RESPONSE" -lt 400 ]; then
+            echo "Render backend is warm and healthy."
+          else
+            echo "Warning: Render returned status $RESPONSE (container may be booting)."
+          fi

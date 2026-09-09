@@ -599,4 +599,20 @@ def test_mobile_dev_secret_hmac():
     assert res.status_code == 200
 
 
+def test_anti_cold_start_keep_alive_config_and_health():
+    """Verify anti-cold-start keep-alive configuration and health endpoint response."""
+    from app.core.config import settings
+    assert settings.KEEP_ALIVE_ENABLED is True
+    assert settings.KEEP_ALIVE_INTERVAL_SECONDS == 600
+    assert "health" in settings.public_health_url
+
+    # Health endpoint check
+    res = client.get("/health")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "healthy"
+    assert "uptime_seconds" in data
+
+
+
 

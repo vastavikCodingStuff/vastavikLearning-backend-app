@@ -1,9 +1,65 @@
+import asyncio
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
+import httpx
 from fastapi import FastAPI, Request, status
+
+logger = logging.getLogger("vastavik.backend")
+
+
+async def render_anti_cold_start_worker():
+    """
+    Background worker that pings the public health endpoint every 10 minutes.
+    Render free tier services spin down after 15 minutes of HTTP inactivity.
+    By pinging the external public URL through Render's router, this resets
+    Render's inactivity timer and keeps the service alive 24/7.
+    """
+    if not settings.KEEP_ALIVE_ENABLED:
+        logger.info("[Anti-Cold-Start] Keep-alive worker is disabled.")
+        return
+
+    # Wait 45 seconds after server launch before first keep-alive cycle
+    try:
+        await asyncio.sleep(45)
+    except asyncio.CancelledError:
+        return
+
+    health_url = settings.public_health_url
+    logger.info(f"[Anti-Cold-Start] Active. Pinging {health_url} every {settings.KEEP_ALIVE_INTERVAL_SECONDS}s")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            try:
+                await asyncio.sleep(settings.KEEP_ALIVE_INTERVAL_SECONDS)
+                response = await client.get(health_url)
+                logger.info(f"[Anti-Cold-Start] Ping {health_url} -> Status {response.status_code}")
+            except asyncio.CancelledError:
+                logger.info("[Anti-Cold-Start] Worker cancelled.")
+                break
+            except Exception as e:
+                logger.warning(f"[Anti-Cold-Start] Ping failed: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Setup upload directory
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+
+    # Start anti-cold-start background keep-alive task
+    keep_alive_task = asyncio.create_task(render_anti_cold_start_worker())
+
+    yield
+
+    # Teardown / cleanup
+    keep_alive_task.cancel()
+    try:
+        await keep_alive_task
+    except asyncio.CancelledError:
+        pass
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles

@@ -97,5 +97,20 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 50
 
+    # Render Anti-Cold-Start & Keep-Alive Settings
+    KEEP_ALIVE_ENABLED: bool = True
+    KEEP_ALIVE_INTERVAL_SECONDS: int = 600  # 10 minutes (Render spins down after 15 mins)
+    RENDER_EXTERNAL_URL: Optional[str] = "https://vastaviklearning-backend-app.onrender.com"
+
+    @property
+    def public_health_url(self) -> str:
+        """Returns the public health endpoint URL for keep-alive pings."""
+        if self.RENDER_EXTERNAL_URL and self.RENDER_EXTERNAL_URL.strip():
+            return f"{self.RENDER_EXTERNAL_URL.strip().rstrip('/')}/health"
+        host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+        if host and host.strip():
+            return f"https://{host.strip().rstrip('/')}/health"
+        return "https://vastaviklearning-backend-app.onrender.com/health"
+
 
 settings = Settings()
