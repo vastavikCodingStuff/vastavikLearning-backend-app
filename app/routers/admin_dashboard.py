@@ -6,6 +6,7 @@ All routes require admin JWT claim.
 """
 import json
 import logging
+import re
 import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -1717,9 +1718,30 @@ class CourseCreate(BaseModel):
 async def create_video(body: VideoCreate, admin_user: Dict[str, Any] = Depends(require_admin_user)):
     """Registers an unlisted or public YouTube video lecture."""
     vid_id = body.id or str(uuid.uuid4())
+
+    # Ensure clean 11-character video ID is resolved
+    extracted_id = (body.youtube_video_id or "").strip()
+    if len(extracted_id) != 11:
+        match = re.search(
+            r"[?&]v=([A-Za-z0-9_-]{11})|youtu\.be/([A-Za-z0-9_-]{11})|youtube\.com/(?:shorts|embed|live)/([A-Za-z0-9_-]{11})",
+            body.youtube_url or extracted_id
+        )
+        if match:
+            extracted_id = next(g for g in match.groups() if g is not None)
+
     data = body.model_dump() | {
         "id": vid_id,
+        "youtube_video_id": extracted_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        # Populate camelCase fields for direct Android Firestore stream listeners
+        "youtubeUrl": body.youtube_url,
+        "youtubeVideoId": extracted_id,
+        "durationSec": body.duration_sec,
+        "videoFormat": body.video_type,
+        "whiteboardImageUrl": body.whiteboard_image_url or "",
+        "codeSample": body.code_sample or "",
+        "isPremium": body.is_premium,
+        "isPublished": True,
     }
     try:
         db.collection("videos").document(vid_id).set(data)
