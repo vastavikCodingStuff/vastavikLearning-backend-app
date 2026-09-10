@@ -385,7 +385,7 @@ async def ai_chat(request: ChatRequest, current_user: Optional[Dict[str, Any]] =
 
 
 @router.post("/ai/conversations/telemetry")
-async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)):
+async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     Receives synchronized student chat conversation telemetry from mobile app cache,
     persisting into Firestore for admin real-time visibility.
@@ -399,10 +399,28 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
         raw_messages = payload.get("messages", [])
         app_version = payload.get("appVersion", "")
         device_model = payload.get("deviceModel", "")
-        user_uid = (current_user.get("sub") or current_user.get("uid")) if current_user else None
-        uid = user_uid or payload.get("uid") or "student"
-        student_name = current_user.get("name") if current_user else payload.get("studentName", "Student")
-        student_email = current_user.get("email") if current_user else payload.get("studentEmail", "")
+        uid = current_user.get("sub") or current_user.get("uid")
+        if not uid:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+        student_name = current_user.get("name") or "Student"
+        student_email = current_user.get("email") or ""
+
+        # Validate conversation ownership if document already exists
+        doc_ref = db.collection("ai_chat_sessions").document(conv_id)
+        try:
+            existing_doc = doc_ref.get()
+            if existing_doc and existing_doc.exists:
+                existing_data = existing_doc.to_dict() or {}
+                existing_uid = existing_data.get("uid")
+                if existing_uid and existing_uid != uid:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Forbidden: Cannot overwrite conversation belonging to another user",
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
         flagged_reasons = set()
         flagged_terms = set()
@@ -422,7 +440,6 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
                     m["flagged_terms"] = mod["flagged_terms"]
             enriched_messages.append(m)
 
-        doc_ref = db.collection("ai_chat_sessions").document(conv_id)
         doc_ref.set({
             "session_id": conv_id,
             "uid": uid,
