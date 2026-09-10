@@ -399,8 +399,10 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
         raw_messages = payload.get("messages", [])
         app_version = payload.get("appVersion", "")
         device_model = payload.get("deviceModel", "")
-        uid = current_user.get("uid", "student") if current_user else "student"
-        student_name = current_user.get("name", "Student") if current_user else "Student"
+        user_uid = (current_user.get("sub") or current_user.get("uid")) if current_user else None
+        uid = user_uid or payload.get("uid") or "student"
+        student_name = current_user.get("name") if current_user else payload.get("studentName", "Student")
+        student_email = current_user.get("email") if current_user else payload.get("studentEmail", "")
 
         flagged_reasons = set()
         flagged_terms = set()
@@ -425,6 +427,7 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
             "session_id": conv_id,
             "uid": uid,
             "student_name": student_name,
+            "student_email": student_email,
             "title": title,
             "messages": enriched_messages,
             "message_count": len(enriched_messages),
@@ -436,6 +439,34 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "created_at": datetime.now(timezone.utc).isoformat()
         }, merge=True)
+
+        # Mirror newest user message & assistant reply to student activity logs
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            last_user_msg = next((m.get("content") for m in reversed(enriched_messages) if m.get("role") == "user"), None)
+            last_asst_msg = next((m.get("content") for m in reversed(enriched_messages) if m.get("role") == "assistant"), None)
+            if last_user_msg:
+                act_id = f"act_ai_{conv_id}_{len(enriched_messages)}"
+                await db.save_activity_log({
+                    "id": act_id,
+                    "uid": uid,
+                    "student_name": student_name,
+                    "student_email": student_email,
+                    "event": "AI_CHAT",
+                    "query": last_user_msg,
+                    "response": last_asst_msg or "AI response generated",
+                    "metadata": {
+                        "conversation_id": conv_id,
+                        "title": title,
+                        "message_count": len(enriched_messages),
+                        "is_flagged": is_conv_flagged,
+                    },
+                    "timestamp": now_iso,
+                    "received_at": now_iso,
+                })
+        except Exception:
+            pass
+
         return {"status": "synced", "conversation_id": conv_id, "is_flagged": is_conv_flagged}
     except Exception as e:
         logger.warning(f"Telemetry sync error: {e}")
@@ -481,11 +512,10 @@ async def list_student_ai_sessions(
     uid = current_user.get("sub") or current_user.get("uid")
     from app.db.firebase import db
     try:
-        if db.use_live_firestore:
-            ref = db._firestore_client.collection("ai_chat_sessions").where("uid", "==", uid)
-            docs = [d.to_dict() | {"session_id": d.id} for d in ref.stream()]
-            docs.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-            return docs
+        docs = db.collection("ai_chat_sessions").where("uid", "==", uid).stream()
+        results = [d.to_dict() | {"session_id": d.id} for d in docs]
+        results.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+        return results
     except Exception as e:
         logger.warning(f"Error reading ai_chat_sessions: {e}")
     return []
@@ -502,12 +532,11 @@ async def get_student_ai_session(
     uid = current_user.get("sub") or current_user.get("uid")
     from app.db.firebase import db
     try:
-        if db.use_live_firestore:
-            doc = db._firestore_client.collection("ai_chat_sessions").document(session_id).get()
-            if doc.exists:
-                data = doc.to_dict()
-                if data.get("uid") == uid or current_user.get("role") == "admin":
-                    return {"session_id": session_id, "messages": data.get("messages", [])}
+        doc = db.collection("ai_chat_sessions").document(session_id).get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data.get("uid") == uid or current_user.get("role") == "admin":
+                return {"session_id": session_id, "messages": data.get("messages", [])}
     except Exception as e:
         logger.warning(f"Error reading ai_chat_session {session_id}: {e}")
     raise HTTPException(status_code=404, detail="AI chat session not found.")
@@ -524,12 +553,11 @@ async def delete_student_ai_session(
     uid = current_user.get("sub") or current_user.get("uid")
     from app.db.firebase import db
     try:
-        if db.use_live_firestore:
-            ref = db._firestore_client.collection("ai_chat_sessions").document(session_id)
-            doc = ref.get()
-            if doc.exists and (doc.to_dict().get("uid") == uid or current_user.get("role") == "admin"):
-                ref.delete()
-                return {"success": True, "message": "Session deleted."}
+        ref = db.collection("ai_chat_sessions").document(session_id)
+        doc = ref.get()
+        if doc.exists and (doc.to_dict().get("uid") == uid or current_user.get("role") == "admin"):
+            ref.delete()
+            return {"success": True, "message": "Session deleted."}
     except Exception as e:
         logger.warning(f"Error deleting ai_chat_session {session_id}: {e}")
     return {"success": True, "message": "Session cleared."}

@@ -8,10 +8,14 @@ Serves:
 All cached in memory with 10-minute TTL for ultra-low latency & 0 unnecessary DB reads.
 """
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Query, Depends
+from fastapi import APIRouter, Query, Depends, HTTPException, status
+from pydantic import BaseModel
 
 from app.core.rate_limiter import rate_limit
+from app.core.security import get_current_user_optional, get_current_user
 from app.db.firebase import db
 from app.models.schemas import (
     MCQItemResponse,
@@ -358,3 +362,126 @@ async def get_quizzes(
     result = [QuizSetResponse(**i) for i in items]
     set_cached(cache_key, result)
     return result
+
+
+class PracticeSubmitPayload(BaseModel):
+    id: Optional[str] = None
+    type: str  # "mcq", "predict_output", "coding", "quiz"
+    topic: Optional[str] = None
+    difficulty: Optional[str] = None
+    language: Optional[str] = None
+    question: Optional[str] = None
+    options: Optional[List[str]] = None
+    selected_option: Optional[Any] = None
+    correct_option: Optional[Any] = None
+    code_snippet: Optional[str] = None
+    predicted_output: Optional[str] = None
+    actual_output: Optional[str] = None
+    problem_title: Optional[str] = None
+    solution_code: Optional[str] = None
+    user_code: Optional[str] = None
+    verdict: Optional[str] = None  # "CORRECT", "INCORRECT", "GENERATED", "SOLVED"
+    is_correct: Optional[bool] = None
+    score: Optional[int] = None
+    total_questions: Optional[int] = None
+    explanation: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@router.post("/submit", dependencies=[Depends(rate_limit("general"))])
+async def submit_practice_attempt(
+    payload: PracticeSubmitPayload,
+    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+):
+    """
+    Persists a student practice interaction (MCQ answer, Predict Output trace, Coding problem).
+    Saves to practice_attempts collection and activity_logs for real-time visibility.
+    """
+    uid = (current_user.get("sub") or current_user.get("uid")) if current_user else "anonymous"
+    student_name = current_user.get("name", "Student") if current_user else "Student"
+    student_email = current_user.get("email", "") if current_user else ""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc_id = payload.id or f"prc_{uuid.uuid4().hex[:12]}"
+
+    attempt_record = {
+        "id": doc_id,
+        "uid": uid,
+        "student_name": student_name,
+        "student_email": student_email,
+        "type": payload.type,
+        "topic": payload.topic or "",
+        "difficulty": payload.difficulty or "",
+        "language": payload.language or "",
+        "question": payload.question or "",
+        "options": payload.options or [],
+        "selected_option": payload.selected_option,
+        "correct_option": payload.correct_option,
+        "code_snippet": payload.code_snippet or "",
+        "predicted_output": payload.predicted_output or "",
+        "actual_output": payload.actual_output or "",
+        "problem_title": payload.problem_title or "",
+        "solution_code": payload.solution_code or "",
+        "user_code": payload.user_code or "",
+        "verdict": payload.verdict or ("CORRECT" if payload.is_correct else ("INCORRECT" if payload.is_correct is False else "SUBMITTED")),
+        "is_correct": payload.is_correct,
+        "score": payload.score,
+        "total_questions": payload.total_questions,
+        "explanation": payload.explanation or "",
+        "created_at": payload.timestamp or now_iso,
+    }
+
+    try:
+        db.collection("practice_attempts").document(doc_id).set(attempt_record)
+    except Exception as e:
+        pass
+
+    # Mirror into activity_logs
+    try:
+        event_name = f"PRACTICE_{payload.type.upper()}"
+        activity_entry = {
+            "id": f"act_{doc_id}",
+            "uid": uid,
+            "student_name": student_name,
+            "student_email": student_email,
+            "event": event_name,
+            "query": payload.problem_title or payload.topic or payload.question or f"Practice {payload.type}",
+            "response": payload.explanation or payload.actual_output or payload.solution_code or payload.verdict,
+            "metadata": {
+                "type": payload.type,
+                "topic": payload.topic,
+                "verdict": attempt_record["verdict"],
+                "is_correct": payload.is_correct,
+                "language": payload.language,
+                "score": payload.score,
+            },
+            "timestamp": payload.timestamp or now_iso,
+            "received_at": now_iso,
+        }
+        await db.save_activity_log(activity_entry)
+    except Exception:
+        pass
+
+    return {"success": True, "id": doc_id, "status": "recorded"}
+
+
+@router.get("/history", dependencies=[Depends(rate_limit("general"))])
+async def get_practice_history(
+    uid: Optional[str] = None,
+    limit: int = 100,
+    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+):
+    """
+    Returns student practice attempt history.
+    """
+    target_uid = uid or ((current_user.get("sub") or current_user.get("uid")) if current_user else None)
+    if not target_uid:
+        return []
+
+    try:
+        docs = db.collection("practice_attempts").where("uid", "==", target_uid).stream()
+        results = [d.to_dict() | {"id": d.id} for d in docs]
+        results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return results[:limit]
+    except Exception:
+        return []
+
