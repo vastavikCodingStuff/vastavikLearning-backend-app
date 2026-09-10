@@ -64,14 +64,13 @@ async def search_content(
 
 @router.get("/search/history", dependencies=[Depends(rate_limit("general"))])
 async def get_search_history(
-    uid: Optional[str] = None,
     limit: int = 50,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Returns past search queries for the user so they appear when opening the app with their account.
+    Returns past search queries for the authenticated user.
     """
-    target_uid = uid or ((current_user.get("sub") or current_user.get("uid")) if current_user else None)
+    target_uid = current_user.get("sub") or current_user.get("uid")
     if not target_uid:
         return []
 

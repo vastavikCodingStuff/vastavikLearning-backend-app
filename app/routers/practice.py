@@ -391,15 +391,17 @@ class PracticeSubmitPayload(BaseModel):
 @router.post("/submit", dependencies=[Depends(rate_limit("general"))])
 async def submit_practice_attempt(
     payload: PracticeSubmitPayload,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
     Persists a student practice interaction (MCQ answer, Predict Output trace, Coding problem).
     Saves to practice_attempts collection and activity_logs for real-time visibility.
     """
-    uid = (current_user.get("sub") or current_user.get("uid")) if current_user else "anonymous"
-    student_name = current_user.get("name", "Student") if current_user else "Student"
-    student_email = current_user.get("email", "") if current_user else ""
+    uid = current_user.get("sub") or current_user.get("uid")
+    if not uid:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    student_name = current_user.get("name") or "Student"
+    student_email = current_user.get("email") or ""
     now_iso = datetime.now(timezone.utc).isoformat()
     doc_id = payload.id or f"prc_{uuid.uuid4().hex[:12]}"
 
@@ -466,14 +468,13 @@ async def submit_practice_attempt(
 
 @router.get("/history", dependencies=[Depends(rate_limit("general"))])
 async def get_practice_history(
-    uid: Optional[str] = None,
     limit: int = 100,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Returns student practice attempt history.
+    Returns student practice attempt history for the authenticated user.
     """
-    target_uid = uid or ((current_user.get("sub") or current_user.get("uid")) if current_user else None)
+    target_uid = current_user.get("sub") or current_user.get("uid")
     if not target_uid:
         return []
 
