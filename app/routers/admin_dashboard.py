@@ -337,7 +337,7 @@ async def get_archived_student(
 
 @router.get("/students/{uid}")
 async def get_student(uid: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
-    """Full student profile + payment history."""
+    """Full student profile + payment history + activity timeline + search + practice + AI chats."""
     try:
         doc = db.collection("users").document(uid).get()
         user_data = doc.to_dict() if doc.exists else {}
@@ -354,6 +354,51 @@ async def get_student(uid: str, admin_user: Dict[str, Any] = Depends(require_adm
         # Fetch payment history
         txns = db.collection("transactions").where("uid", "==", uid).stream()
         student["payment_details"] = [t.to_dict() for t in txns]
+
+        # 1. Fetch activity log timeline
+        try:
+            activities = await db.list_activity_logs(uid=uid, limit=100)
+            student["activities"] = activities
+        except Exception:
+            student["activities"] = []
+
+        # 2. Fetch search logs
+        try:
+            search_docs = db.collection("search_logs").where("uid", "==", uid).stream()
+            searches = [d.to_dict() | {"id": d.id} for d in search_docs]
+            searches.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            student["searches"] = searches
+        except Exception:
+            student["searches"] = []
+
+        # 3. Fetch practice attempts (MCQ, Predict Output, Coding)
+        try:
+            practice_docs = db.collection("practice_attempts").where("uid", "==", uid).stream()
+            practice_items = [d.to_dict() | {"id": d.id} for d in practice_docs]
+            practice_items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            student["practice_history"] = practice_items
+        except Exception:
+            student["practice_history"] = []
+
+        # 4. Fetch AI chat sessions
+        try:
+            chats = []
+            for c in db.collection("ai_chat_sessions").where("uid", "==", uid).stream():
+                chats.append(c.to_dict() | {"session_id": c.id})
+            chats.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+            student["ai_chats"] = chats
+        except Exception:
+            student["ai_chats"] = []
+
+        # 5. Fetch code executions
+        try:
+            code_docs = db.collection("code_executions").where("uid", "==", uid).stream()
+            code_execs = [d.to_dict() | {"id": d.id} for d in code_docs]
+            code_execs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            student["code_executions"] = code_execs
+        except Exception:
+            student["code_executions"] = []
+
         return student
     except HTTPException:
         raise
@@ -478,8 +523,13 @@ async def list_ai_chat_sessions(
         from app.services.moderation import analyze_content_safety
         ref = db.collection("ai_chat_sessions")
         if uid:
-            ref = ref.where("uid", "==", uid)
-        raw_docs = [d.to_dict() | {"session_id": d.id} for d in ref.stream()]
+            raw_docs = []
+            for d in ref.stream():
+                item = d.to_dict() | {"session_id": d.id}
+                if item.get("uid") == uid or item.get("student_id") == uid:
+                    raw_docs.append(item)
+        else:
+            raw_docs = [d.to_dict() | {"session_id": d.id} for d in ref.stream()]
 
         # Dynamically inspect and ensure flagged status is accurate for every session
         analyzed_docs = []
