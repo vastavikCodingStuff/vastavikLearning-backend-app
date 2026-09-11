@@ -31,15 +31,16 @@ def invalidate_catalog_cache():
 
 
 @router.get("/catalog/home", response_model=HomeCatalogResponse, dependencies=[Depends(rate_limit("general"))])
-async def get_home_catalog():
+async def get_home_catalog(force: bool = False):
     """
     Returns home catalog containing courses, banners, and popular topics.
     Results are cached in RAM for 5 minutes to minimize database reads and latency.
+    Pass ?force=true to bypass cache (used by Learn pull-to-refresh).
     """
     global _catalog_cache, _catalog_cache_timestamp
     now = time.time()
 
-    if _catalog_cache is not None and (now - _catalog_cache_timestamp) < CATALOG_CACHE_TTL_SECONDS:
+    if not force and _catalog_cache is not None and (now - _catalog_cache_timestamp) < CATALOG_CACHE_TTL_SECONDS:
         return _catalog_cache
 
     catalog_data = await db.get_home_catalog()
@@ -49,10 +50,12 @@ async def get_home_catalog():
 
 
 @router.get("/courses/{course_id}/curriculum", response_model=CurriculumResponse, dependencies=[Depends(rate_limit("general"))])
-async def get_curriculum(course_id: str):
+async def get_curriculum(course_id: str, force: bool = False):
     """
     Returns the organized parts and subparts for a given course curriculum.
+    Pass ?force=true to ensure fresh data after admin edits.
     """
+    # Curriculum is not cached server-side currently, but force param is kept for parity and future cache
     parts = await db.get_course_curriculum(course_id)
     return CurriculumResponse(course_id=course_id, parts=parts)
 
@@ -98,11 +101,27 @@ async def get_lesson(lesson_id: str, current_user: Optional[Dict[str, Any]] = De
         lesson["duration_sec"] = lesson.get("durationSec", 0)
     if "description" not in lesson or lesson["description"] is None:
         lesson["description"] = ""
+    if "shorts_url" not in lesson:
+        lesson["shorts_url"] = lesson.get("shortsUrl", "") or lesson.get("shorts_url", "")
+    if "shorts_video_id" not in lesson:
+        lesson["shorts_video_id"] = lesson.get("shortsVideoId", "") or lesson.get("shorts_video_id", "")
+    if "privacy" not in lesson:
+        lesson["privacy"] = lesson.get("privacy", "unlisted")
+    if "is_published" not in lesson and "isPublished" in lesson:
+        lesson["is_published"] = lesson["isPublished"]
 
-    # Normalize format for Android client (vscode -> screen_recording)
+    # Normalize format for Android client (vscode/screen/shorts -> canonical)
     fmt = lesson.get("video_format") or lesson.get("videoFormat") or "screen_recording"
-    if fmt == "vscode":
+    if fmt in ("vscode", "screen", "screen_recording"):
         fmt = "screen_recording"
+    elif fmt in ("shorts", "short"):
+        fmt = "short"
+        if not lesson.get("shorts_url"):
+            lesson["shorts_url"] = lesson.get("youtube_url", "")
+        if not lesson.get("shorts_video_id"):
+            lesson["shorts_video_id"] = lesson.get("youtube_video_id", "")
+    elif fmt == "whiteboard":
+        fmt = "whiteboard"
     lesson["video_format"] = fmt
     return lesson
 
