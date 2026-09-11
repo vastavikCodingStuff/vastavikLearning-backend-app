@@ -136,6 +136,26 @@ async def get_lesson(lesson_id: str, current_user: Optional[Dict[str, Any]] = De
     return lesson
 
 
+@router.get("/lessons/by-subpart/{course_id}/{part_id}/{subpart_id}", response_model=LessonResponse, dependencies=[Depends(rate_limit("general"))])
+async def get_lesson_by_subpart(
+    course_id: str,
+    part_id: str,
+    subpart_id: str,
+    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+):
+    """
+    Resolves the playable video behind a curriculum subpart link.
+    Fixes 'Video not found' when the subpart carries no lesson_id
+    (curriculum falls back to the subpart id) or when the video lives
+    as a nested lesson under the subpart.
+    """
+    lesson = await db.get_lesson_by_subpart(course_id, part_id, subpart_id)
+    if not lesson:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found. It may have been moved or deleted — pull to refresh Learn and try again.")
+    # Reuse the same normalization/premium path as get_lesson
+    return await get_lesson(lesson.get("id", subpart_id), current_user)
+
+
 @router.post("/progress/visited", response_model=CommonResponse)
 async def mark_visited(request: VisitedRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """
