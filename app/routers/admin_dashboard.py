@@ -1951,3 +1951,94 @@ async def add_lesson_to_part(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.delete("/courses/{course_id}/parts/{part_id}/subparts/{subpart_id}")
+async def delete_lesson_from_part(
+    course_id: str,
+    part_id: str,
+    subpart_id: str,
+    delete_video: bool = False,
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """
+    Deletes a lesson (subpart link) from a curriculum part. Idempotent.
+    Pass ?delete_video=true to also delete the linked flat video doc.
+    """
+    try:
+        sub_ref = (
+            db.collection("courses").document(course_id)
+            .collection("parts").document(part_id)
+            .collection("subparts").document(subpart_id)
+        )
+        linked_id: Optional[str] = None
+        try:
+            snap = sub_ref.get()
+            if snap.exists:
+                linked_id = (snap.to_dict() or {}).get("lesson_id")
+        except Exception:
+            pass
+        # Best-effort: nested lessons under the subpart
+        try:
+            for n_doc in sub_ref.collection("lessons").stream():
+                try:
+                    n_doc.reference.delete()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            sub_ref.delete()
+        except Exception:
+            pass
+        if delete_video and linked_id:
+            try:
+                db.collection("videos").document(linked_id).delete()
+            except Exception:
+                pass
+        try:
+            from app.routers.catalog import invalidate_catalog_cache
+            invalidate_catalog_cache()
+        except Exception:
+            pass
+        return {"success": True, "subpart_id": subpart_id, "deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/courses/{course_id}/parts/{part_id}")
+async def delete_part(
+    course_id: str,
+    part_id: str,
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """
+    Deletes a curriculum part (collection) and all its subpart/lesson children. Idempotent.
+    """
+    try:
+        part_ref = db.collection("courses").document(course_id).collection("parts").document(part_id)
+        try:
+            for s_doc in part_ref.collection("subparts").stream():
+                try:
+                    for n_doc in s_doc.reference.collection("lessons").stream():
+                        try:
+                            n_doc.reference.delete()
+                        except Exception:
+                            pass
+                    s_doc.reference.delete()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            part_ref.delete()
+        except Exception:
+            pass
+        try:
+            from app.routers.catalog import invalidate_catalog_cache
+            invalidate_catalog_cache()
+        except Exception:
+            pass
+        return {"success": True, "part_id": part_id, "deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+

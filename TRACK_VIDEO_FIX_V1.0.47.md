@@ -191,3 +191,12 @@ Branches (pushed, awaiting your `PR UPDATE`):
 - **Likes/dislikes/comments work:** previously in-memory only. Now persisted per-lesson in `SharedPreferences("lesson_feedback")` (`like_/dislike_/comments_<lessonId>`) + `ActivityLog.videoLike/video_dislike/video_comment` telemetry. Counts survive process death.
 - **Admin code/whiteboard/shorts alongside link:** all three inputs now ALWAYS visible in `UploadVideoModal` (whiteboard was gated on `type==whiteboard`, shorts on `type==short`); whiteboard has URL + file upload (`POST /api/v1/admin/uploads/whiteboard`, 5 MB, jpg/png/webp → `/uploads/whiteboards/wb_*.ext`); shorts has helper text; code textarea always shown.
 - **No-YouTube-branding:** player keeps `modestbranding/rel=0/ivLoadPolicy=3`, watermark shield, plus `Learn with Vastavik` header so students never see a bare YouTube frame.
+
+## 7) Round 3 - delete options + Video not found for every lesson (branches, NOT merged)
+
+Branches (pushed, awaiting your PR UPDATE):
+- backend fix/lesson-delete-resolve - firebase.py get_lesson step 3 (subpart-link resolution) + get_lesson_by_subpart, catalog.py GET /api/v1/lessons/by-subpart/{course}/{part}/{subpart}, admin_dashboard.py DELETE subparts/{sid} (?delete_video=true) + DELETE parts/{pid} (49 pytest green)
+- admin-web fix/lesson-delete-resolve - useCourses.ts removeLessonFromPart/removePart (optimistic + rollback + refetch), curriculum editor per-lesson trash button + per-part Delete Part button (both with confirm)
+- app fix/lesson-delete-resolve - getLessonBySubpart API+repo, ViewModel step 1.5 subpart resolution, v1.0.61 (app 61 / companion 28), compileDebugKotlin green
+
+Why every video said Video not found: get_course_curriculum returns lesson_id = field or subpart-doc-id. For manually created subparts with no lesson_id field, the app received the SUBPART id (e.g. 8kdGIQMKX7dCbBv81m1D) as the lesson id, but get_lesson only looked in flat videos + collection_group(lessons) - never at the subpart itself. Now step 3 checks collection_group(subparts) (video fields on the doc, nested lessons, or linked flat video) and the new by-subpart endpoint resolves via the exact course/part/subpart path the app already navigates with. If Render is in in-memory mode, /health/firestore will show it - set FIREBASE_CREDENTIALS_BASE64 so uploads persist.

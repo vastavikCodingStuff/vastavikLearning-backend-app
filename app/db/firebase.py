@@ -485,10 +485,76 @@ class DatabaseRepository:
                     if l_doc.id == lesson_id or d.get("id") == lesson_id:
                         d["id"] = l_doc.id
                         return d
+
+                # 3. Resolve via subpart links: the id may be a subpart doc whose
+                # lesson_id field points at the real video, or a subpart with no
+                # lesson_id whose nested `lessons` subcollection holds the video.
+                for s_doc in _firestore_client.collection_group("subparts").stream():
+                    s_data = s_doc.to_dict() or {}
+                    linked_id = s_data.get("lesson_id")
+                    if s_doc.id == lesson_id or linked_id == lesson_id:
+                        # 3a. Subpart doc itself carries video fields (title/youtubeUrl)
+                        if s_data.get("youtubeUrl") or s_data.get("youtube_url") or s_data.get("youtubeVideoId") or s_data.get("youtube_video_id"):
+                            merged = dict(s_data)
+                            merged["id"] = s_doc.id
+                            if not merged.get("title"):
+                                merged["title"] = "Untitled Lesson"
+                            return merged
+                        # 3b. Nested lessons under this subpart: prefer exact id, else first
+                        try:
+                            nested = list(s_doc.reference.collection("lessons").stream())
+                        except Exception:
+                            nested = []
+                        for n_doc in nested:
+                            n_data = n_doc.to_dict() or {}
+                            if n_doc.id == lesson_id or n_data.get("id") == lesson_id:
+                                n_data["id"] = n_doc.id
+                                return n_data
+                        if nested and (s_doc.id == lesson_id or not linked_id):
+                            first = nested[0]
+                            f_data = first.to_dict() or {}
+                            f_data["id"] = first.id
+                            return f_data
+                        # 3c. Follow the linked flat video id
+                        if linked_id:
+                            v_doc = _firestore_client.collection("videos").document(linked_id).get()
+                            if v_doc.exists:
+                                d = v_doc.to_dict()
+                                d["id"] = v_doc.id
+                                return d
             except Exception as e:
                 logger.warning(f"Error querying live lesson '{lesson_id}' from Firestore: {e}")
 
         return self._lessons.get(lesson_id)
+
+    async def get_lesson_by_subpart(self, course_id: str, part_id: str, subpart_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve the playable video for a curriculum subpart link."""
+        if self.use_live_firestore and _firestore_client is not None:
+            try:
+                s_doc = (
+                    _firestore_client.collection("courses").document(course_id)
+                    .collection("parts").document(part_id)
+                    .collection("subparts").document(subpart_id)
+                    .get()
+                )
+                if s_doc.exists:
+                    s_data = s_doc.to_dict() or {}
+                    linked_id = s_data.get("lesson_id") or subpart_id
+                    lesson = await self.get_lesson(linked_id)
+                    if lesson:
+                        return lesson
+                    # Fall back to first nested lesson under the subpart
+                    try:
+                        nested = list(s_doc.reference.collection("lessons").stream())
+                    except Exception:
+                        nested = []
+                    if nested:
+                        f_data = nested[0].to_dict() or {}
+                        f_data["id"] = nested[0].id
+                        return f_data
+            except Exception as e:
+                logger.warning(f"Error resolving subpart {course_id}/{part_id}/{subpart_id}: {e}")
+        return None
 
     async def mark_visited(self, uid: str, course_id: str, part_id: str) -> bool:
         entry = f"{course_id}::{part_id}"
