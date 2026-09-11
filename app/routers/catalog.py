@@ -44,6 +44,16 @@ async def get_home_catalog(force: bool = False):
         return _catalog_cache
 
     catalog_data = await db.get_home_catalog()
+    import logging
+    try:
+        courses = catalog_data.get("courses", [])
+        if not courses:
+            logging.getLogger("vastavik.catalog").warning(
+                "get_home_catalog returned 0 courses (live=%s). Check Firestore 'courses' collection and credentials.",
+                getattr(db, "use_live_firestore", False),
+            )
+    except Exception:
+        pass
     _catalog_cache = catalog_data
     _catalog_cache_timestamp = now
     return catalog_data
