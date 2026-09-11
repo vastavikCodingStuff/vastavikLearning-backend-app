@@ -6,7 +6,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Form
 
 from app.core.config import settings
-from app.core.security import get_current_user, get_current_user_optional
+from app.core.security import get_current_user, get_current_user_optional, require_admin_user
 from app.core.rate_limiter import rate_limit
 from app.db.firebase import db
 from app.models.schemas import AppUpdateResponse, FcmTokenRequest, CommonResponse
@@ -139,3 +139,64 @@ async def register_fcm_token(request: FcmTokenRequest, current_user: Dict[str, A
     uid = current_user.get("sub")
     await db.save_fcm_token(uid, request.fcm_token)
     return CommonResponse(success=True, message="Device push token registered.")
+
+
+@router.get("/health/firestore")
+async def firestore_health():
+    """
+    Exposes Firestore connectivity so admin/app can diagnose
+    'things not loading' issues. Shows live vs in-memory mode,
+    project id, and collection counts. No auth required (status only).
+    """
+    import logging
+    logger = logging.getLogger("vastavik.health")
+    info: Dict[str, Any] = {
+        "use_live_firestore": bool(getattr(db, "use_live_firestore", False)),
+        "project_id": getattr(settings, "FIREBASE_PROJECT_ID", ""),
+        "collections": {},
+        "warning": None,
+    }
+    try:
+        for coll in ("courses", "videos", "users"):
+            try:
+                docs = list(db.collection(coll).stream())
+                info["collections"][coll] = len(docs)
+            except Exception as e:
+                info["collections"][coll] = f"error: {e}"
+    except Exception as e:
+        info["warning"] = str(e)
+    if not info["use_live_firestore"]:
+        info["warning"] = (
+            "Backend is running in IN-MEMORY mode (no Firestore credentials). "
+            "Admin uploads will NOT appear in the app's direct Firestore listeners "
+            "and will be lost on restart. Set FIREBASE_CREDENTIALS_BASE64 on Render."
+        )
+        logger.warning("Firestore health: in-memory mode")
+    return info
+
+
+@router.post("/admin/uploads/whiteboard")
+async def upload_whiteboard_image(
+    file: UploadFile = File(...),
+    admin_user: Dict[str, Any] = Depends(require_admin_user),
+):
+    """
+    Stores a whiteboard screenshot uploaded from the admin video modal
+    under uploads/whiteboards and returns a public /uploads URL that can
+    be saved as whiteboard_image_url on a video. Admin-only.
+    """
+    ext = os.path.splitext(file.filename)[1].lower() if file.filename else ".png"
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported image format '{ext}'. Allowed: JPG, PNG, WEBP.",
+        )
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image too large (max 5 MB).")
+    dest_dir = os.path.join(settings.UPLOAD_DIR, "whiteboards")
+    os.makedirs(dest_dir, exist_ok=True)
+    filename = f"wb_{uuid.uuid4().hex[:10]}{ext}"
+    with open(os.path.join(dest_dir, filename), "wb") as f:
+        f.write(content)
+    return {"success": True, "url": f"/uploads/whiteboards/{filename}"}

@@ -1781,6 +1781,11 @@ async def create_video(body: VideoCreate, admin_user: Dict[str, Any] = Depends(r
         )
         if match:
             extracted_id = next(g for g in match.groups() if g is not None)
+    if len(extracted_id) != 11:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid video link: could not extract an 11-character YouTube video ID. Paste a watch/youtu.be/shorts/embed URL or the raw ID.",
+        )
 
     data = body.model_dump() | {
         "id": vid_id,
