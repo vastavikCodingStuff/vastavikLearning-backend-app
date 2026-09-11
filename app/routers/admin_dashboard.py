@@ -1752,6 +1752,9 @@ class VideoCreate(BaseModel):
     is_premium: bool = False
     order: int = 1
     course_id: Optional[str] = None
+    privacy: str = "unlisted"  # public | unlisted | private
+    is_published: bool = True
+    shorts_url: Optional[str] = None
 
 
 class CourseCreate(BaseModel):
@@ -1791,10 +1794,18 @@ async def create_video(body: VideoCreate, admin_user: Dict[str, Any] = Depends(r
         "whiteboardImageUrl": body.whiteboard_image_url or "",
         "codeSample": body.code_sample or "",
         "isPremium": body.is_premium,
-        "isPublished": True,
+        "isPublished": body.is_published,
+        "privacy": body.privacy,
+        "shortsUrl": body.shorts_url or (body.youtube_url if body.video_type == "short" else ""),
+        "shortsVideoId": extracted_id if body.video_type == "short" else "",
     }
     try:
         db.collection("videos").document(vid_id).set(data)
+        try:
+            from app.routers.catalog import invalidate_catalog_cache
+            invalidate_catalog_cache()
+        except Exception:
+            pass
     except Exception:
         pass
     return {"success": True, "video": data}
@@ -1803,11 +1814,32 @@ async def create_video(body: VideoCreate, admin_user: Dict[str, Any] = Depends(r
 @router.delete("/videos/{video_id}")
 async def delete_video(video_id: str, admin_user: Dict[str, Any] = Depends(require_admin_user)):
     """
-    Deletes a video from the flat `videos` collection (used by the admin web
-    UploadVideoModal). Idempotent: returns success even if the doc doesn't exist.
+    Deletes a video from the flat `videos` collection and best-effort nested lessons.
+    Idempotent: returns success even if the doc doesn't exist.
     """
     try:
         db.collection("videos").document(video_id).delete()
+        # Best-effort: also delete nested curriculum copies if any
+        try:
+            for doc in db.collection("videos").document(video_id).collection("lessons").stream():
+                doc.reference.delete()
+        except Exception:
+            pass
+        try:
+            # Remove subpart refs pointing to this lesson_id
+            for course_doc in db.collection("courses").stream():
+                for part_doc in db.collection("courses").document(course_doc.id).collection("parts").stream():
+                    for subpart_doc in db.collection("courses").document(course_doc.id).collection("parts").document(part_doc.id).collection("subparts").stream():
+                        data = subpart_doc.to_dict() or {}
+                        if data.get("lesson_id") == video_id or data.get("lessonId") == video_id:
+                            subpart_doc.reference.delete()
+        except Exception:
+            pass
+        try:
+            from app.routers.catalog import invalidate_catalog_cache
+            invalidate_catalog_cache()
+        except Exception:
+            pass
         return {"success": True, "video_id": video_id, "deleted": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1903,6 +1935,11 @@ async def add_lesson_to_part(
             "lesson_id": body.lesson_id,
         }
         part_ref.collection("subparts").document(sub_id).set(subpart)
+        try:
+            from app.routers.catalog import invalidate_catalog_cache
+            invalidate_catalog_cache()
+        except Exception:
+            pass
         return {"success": True, "subpart": subpart}
     except HTTPException:
         raise
