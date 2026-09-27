@@ -49,6 +49,10 @@ class OAuthGitHubRequest(BaseModel):
     code: str
 
 
+class OAuthClerkRequest(BaseModel):
+    session_token: str
+
+
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
 

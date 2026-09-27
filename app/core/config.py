@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     GITHUB_CLIENT_SECRET: Optional[str] = None
     GOOGLE_CLIENT_ID: Optional[str] = None
 
+    # Clerk (session-token -> backend JWT bridge)
+    CLERK_PUBLISHABLE_KEY: Optional[str] = None
+    CLERK_SECRET_KEY: Optional[str] = None
+
     # Payment Gateway (legacy)
     PAYMENT_GATEWAY_KEY: Optional[str] = None
     PAYMENT_GATEWAY_SECRET: Optional[str] = None
