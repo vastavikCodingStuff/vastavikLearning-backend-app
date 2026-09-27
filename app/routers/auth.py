@@ -1,7 +1,10 @@
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 from datetime import datetime, timezone
+import base64
 import httpx
+import jwt
+from jwt import PyJWKClient
 from fastapi import APIRouter, HTTPException, status, Depends
 
 from app.core.config import settings
@@ -22,6 +25,7 @@ from app.models.schemas import (
     LoginRequest,
     OAuthGoogleRequest,
     OAuthGitHubRequest,
+    OAuthClerkRequest,
     RefreshTokenRequest,
     DeviceVerifyRequest,
     AuthResponse,
@@ -325,6 +329,178 @@ async def oauth_github(request: OAuthGitHubRequest):
             "name": name,
             "email": email.lower(),
             "github_id": gh_id,
+            "role": "student",
+            "board": "ICSE",
+            "preferred_language": "Java",
+            "is_premium": False,
+            "streak_count": 1,
+            "total_lessons_completed": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.save_user(user)
+
+    token_payload = {"sub": user["uid"], "email": user["email"], "role": user.get("role", "student"), "name": user["name"]}
+    tv = await get_token_version(user["uid"])
+    return AuthResponse(
+        success=True,
+        access_token=create_access_token(token_payload, token_version=tv),
+        refresh_token=create_refresh_token(token_payload, token_version=tv),
+        user_id=user["uid"],
+        name=user["name"],
+        email=user["email"],
+        role=user.get("role", "student"),
+    )
+
+
+# ---- Clerk session-token -> backend JWT bridge ----
+
+_clerk_jwks_uris: Dict[str, str] = {}
+_clerk_jwks_clients: Dict[str, PyJWKClient] = {}
+
+
+def _clerk_fapi_domain() -> str:
+    """Derives the Clerk Frontend API domain from the configured publishable key."""
+    key = (settings.CLERK_PUBLISHABLE_KEY or "").strip()
+    if not key or not key.startswith("pk_"):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Clerk auth is not configured on this server.",
+        )
+    encoded = key.split("_", 2)[-1].split("~")[0]
+    padded = encoded + "=" * (-len(encoded) % 4)
+    try:
+        domain = base64.urlsafe_b64decode(padded.encode()).decode().strip()
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Clerk publishable key is invalid.",
+        )
+    if "." not in domain or "/" in domain or " " in domain:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Clerk publishable key is invalid.",
+        )
+    return domain
+
+
+async def _clerk_jwks_client(domain: str) -> PyJWKClient:
+    cached = _clerk_jwks_clients.get(domain)
+    if cached is not None:
+        return cached
+    jwks_uri = _clerk_jwks_uris.get(domain)
+    if not jwks_uri:
+        jwks_uri = f"https://{domain}/.well-known/jwks.json"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"https://{domain}/.well-known/openid-configuration")
+                if resp.status_code == 200:
+                    jwks_uri = resp.json().get("jwks_uri") or jwks_uri
+        except Exception:
+            pass
+        _clerk_jwks_uris[domain] = jwks_uri
+    _clerk_jwks_clients[domain] = PyJWKClient(jwks_uri, cache_keys=True, timeout=10)
+    return _clerk_jwks_clients[domain]
+
+
+async def _clerk_verify_session_token(token: str) -> Dict[str, Any]:
+    """Verifies the signature, expiry and issuer of a Clerk session JWT."""
+    domain = _clerk_fapi_domain()
+    jwks = await _clerk_jwks_client(domain)
+    try:
+        signing_key = jwks.get_signing_key_from_jwt(token)
+        return jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256", "ES256"],
+            issuer=f"https://{domain}",
+            options={"verify_aud": False, "verify_exp": True, "verify_nbf": False},
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired Clerk session token.",
+        )
+
+
+async def _clerk_resolve_identity(claims: Dict[str, Any]) -> Tuple[str, str]:
+    """Resolves (email, name) for the verified token — from claims or Clerk's Backend API."""
+    sub = (claims.get("sub") or "").strip()
+    if not sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Clerk session token is missing the subject claim.",
+        )
+    email = (claims.get("email") or claims.get("primary_email") or "").strip().lower()
+    name = (claims.get("name") or "").strip()
+
+    if not email:
+        if not settings.CLERK_SECRET_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="Clerk session token carries no email claim and CLERK_SECRET_KEY is not configured.",
+            )
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://api.clerk.com/v1/users/{sub}",
+                    headers={"Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"},
+                )
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to contact Clerk to resolve the account email.",
+            )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unable to resolve the Clerk account email.",
+            )
+        user_info = resp.json()
+        addresses = user_info.get("email_addresses") or []
+        primary_id = user_info.get("primary_email_address_id")
+        chosen = next(
+            (a for a in addresses if a.get("id") == primary_id), None
+        ) or (addresses[0] if addresses else None)
+        email = ((chosen or {}).get("email_address") or "").strip().lower()
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Clerk account has no email address.",
+            )
+        if not name:
+            first = (user_info.get("first_name") or "").strip()
+            last = (user_info.get("last_name") or "").strip()
+            name = (
+                f"{first} {last}".strip()
+                or (user_info.get("username") or "").strip()
+            )
+
+    if not name:
+        name = email.split("@")[0]
+    return email, name
+
+
+@router.post("/auth/clerk", response_model=AuthResponse)
+async def auth_clerk(request: OAuthClerkRequest):
+    """
+    Verifies a Clerk session token (obtained by the client after email/password
+    sign-in, Google/GitHub OAuth or email-OTP verification) and issues this
+    backend's own JWTs, so every existing API keeps working unchanged.
+    """
+    claims = await _clerk_verify_session_token(request.session_token)
+    email, name = await _clerk_resolve_identity(claims)
+
+    user = await db.get_user_by_email(email)
+    if not user:
+        clerk_sub = claims.get("sub") or ""
+        uid = f"usr_clk_{clerk_sub}" if clerk_sub else f"usr_clk_{uuid.uuid4().hex[:16]}"
+        user = {
+            "uid": uid,
+            "name": name,
+            "email": email,
+            "clerk_id": clerk_sub,
             "role": "student",
             "board": "ICSE",
             "preferred_language": "Java",
