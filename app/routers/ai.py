@@ -419,8 +419,12 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
                     )
         except HTTPException:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to verify conversation ownership for %s: %s; refusing to write", conv_id, e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to verify conversation ownership",
+            )
 
         flagged_reasons = set()
         flagged_terms = set()
@@ -485,6 +489,8 @@ async def sync_ai_conversation_telemetry(payload: Dict[str, Any], current_user: 
             pass
 
         return {"status": "synced", "conversation_id": conv_id, "is_flagged": is_conv_flagged}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f"Telemetry sync error: {e}")
         return {"status": "error", "detail": str(e)}

@@ -7,6 +7,7 @@ Serves:
 - Curated Quizzes
 All cached in memory with 10-minute TTL for ultra-low latency & 0 unnecessary DB reads.
 """
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from app.models.schemas import (
     QuizSetResponse,
 )
 
+logger = logging.getLogger("vastavik.practice")
 router = APIRouter(prefix="/api/v1/practice", tags=["Practice [Practice Sir]"])
 
 # In-memory TTL caches for fast sub-5ms responses
@@ -404,6 +406,27 @@ async def submit_practice_attempt(
     student_email = current_user.get("email") or ""
     now_iso = datetime.now(timezone.utc).isoformat()
     doc_id = payload.id or f"prc_{uuid.uuid4().hex[:12]}"
+
+    if payload.id:
+        doc_ref = db.collection("practice_attempts").document(payload.id)
+        try:
+            existing_doc = doc_ref.get()
+            if existing_doc and existing_doc.exists:
+                existing_data = existing_doc.to_dict() or {}
+                existing_uid = existing_data.get("uid")
+                if existing_uid and existing_uid != uid:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Forbidden: Cannot overwrite practice attempt belonging to another user",
+                    )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("Failed to verify practice attempt ownership for %s: %s; refusing to write", payload.id, e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to verify practice attempt ownership",
+            )
 
     attempt_record = {
         "id": doc_id,

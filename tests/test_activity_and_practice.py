@@ -1,4 +1,4 @@
-﻿import time
+import time
 import uuid
 import pytest
 from starlette.testclient import TestClient
@@ -146,3 +146,91 @@ def test_admin_student_detail_includes_activities_and_practice():
     assert "activities" in student_data
     assert "practice_history" in student_data
     assert any(p.get("problem_title") == "Palindrome Check" for p in student_data["practice_history"])
+
+
+def test_user_activity_log_authorization_and_spoofing():
+    alice_uid = f"alice_{uuid.uuid4().hex[:6]}"
+    bob_uid = f"bob_{uuid.uuid4().hex[:6]}"
+    alice_token = create_access_token({"sub": alice_uid, "name": "Alice", "role": "student"})
+    bob_token = create_access_token({"sub": bob_uid, "name": "Bob", "role": "student"})
+    admin_token = create_access_token({"sub": "admin_user", "name": "Admin", "role": "admin"})
+
+    # Ingest log for Alice, but attempt to spoof Bob's UID
+    log_path = "/api/v1/activity/log"
+    spoofed_payload = {
+        "event": "CHEAT_ATTEMPT",
+        "uid": bob_uid,  # Alice tries to impersonate Bob
+        "query": "malicious input",
+    }
+    alice_headers = get_hmac_headers(log_path, "POST", alice_token)
+    res_ingest = client.post(log_path, json=spoofed_payload, headers=alice_headers)
+    assert res_ingest.status_code == 200
+
+    # Verify Alice's log now contains this entry under Alice's uid, not Bob's
+    alice_log_path = f"/api/v1/activity/log/{alice_uid}"
+    alice_get_headers = get_hmac_headers(alice_log_path, "GET", alice_token)
+    res_alice_self = client.get(alice_log_path, headers=alice_get_headers)
+    assert res_alice_self.status_code == 200
+    assert any(item.get("event") == "CHEAT_ATTEMPT" for item in res_alice_self.json()["items"])
+
+    # Alice trying to access Bob's log should be 403 Forbidden
+    bob_log_path = f"/api/v1/activity/log/{bob_uid}"
+    alice_access_bob_headers = get_hmac_headers(bob_log_path, "GET", alice_token)
+    res_alice_access_bob = client.get(bob_log_path, headers=alice_access_bob_headers)
+    assert res_alice_access_bob.status_code == 403
+
+    # Unauthenticated access to log should be 401
+    res_anon = client.get(alice_log_path, headers=get_hmac_headers(alice_log_path, "GET"))
+    assert res_anon.status_code == 401
+
+    # Admin accessing Alice's log should be 200 OK
+    admin_headers = get_hmac_headers(alice_log_path, "GET", admin_token)
+    res_admin = client.get(alice_log_path, headers=admin_headers)
+    assert res_admin.status_code == 200
+
+
+def test_practice_and_ai_ownership_validation():
+    alice_uid = f"alice_own_{uuid.uuid4().hex[:6]}"
+    bob_uid = f"bob_own_{uuid.uuid4().hex[:6]}"
+    alice_token = create_access_token({"sub": alice_uid, "name": "Alice", "role": "student"})
+    bob_token = create_access_token({"sub": bob_uid, "name": "Bob", "role": "student"})
+
+    # Alice submits a practice attempt
+    attempt_id = f"prc_own_{uuid.uuid4().hex[:6]}"
+    path_practice = "/api/v1/practice/submit"
+    alice_practice_headers = get_hmac_headers(path_practice, "POST", alice_token)
+    res1 = client.post(path_practice, json={
+        "id": attempt_id,
+        "type": "mcq",
+        "question": "Q1",
+        "is_correct": True,
+    }, headers=alice_practice_headers)
+    assert res1.status_code == 200
+
+    # Bob attempts to overwrite Alice's practice attempt with the same ID -> 403
+    bob_practice_headers = get_hmac_headers(path_practice, "POST", bob_token)
+    res2 = client.post(path_practice, json={
+        "id": attempt_id,
+        "type": "mcq",
+        "question": "Hacked Question",
+        "is_correct": False,
+    }, headers=bob_practice_headers)
+    assert res2.status_code == 403
+
+    # Alice saves an AI conversation telemetry
+    conv_id = f"conv_own_{uuid.uuid4().hex[:6]}"
+    path_ai = "/api/v1/ai/conversations/telemetry"
+    alice_ai_headers = get_hmac_headers(path_ai, "POST", alice_token)
+    res3 = client.post(path_ai, json={
+        "conversationId": conv_id,
+        "messages": [{"role": "user", "text": "Hello"}],
+    }, headers=alice_ai_headers)
+    assert res3.status_code == 200
+
+    # Bob attempts to overwrite Alice's AI conversation telemetry -> 403
+    bob_ai_headers = get_hmac_headers(path_ai, "POST", bob_token)
+    res4 = client.post(path_ai, json={
+        "conversationId": conv_id,
+        "messages": [{"role": "user", "text": "Overwritten"}],
+    }, headers=bob_ai_headers)
+    assert res4.status_code == 403
